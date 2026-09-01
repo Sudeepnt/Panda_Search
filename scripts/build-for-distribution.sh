@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # ManeAI Distribution Build Script
-# 
+#
 # This script prepares the sidecar for distribution by:
 # 1. Downloading Node.js runtime (if not present)
 # 2. Building the NestJS sidecar
@@ -16,7 +16,7 @@ set -e
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 ROOT_DIR="$( cd "$SCRIPT_DIR/.." && pwd )"
 BACKEND_DIR="$ROOT_DIR/mane-ai-backend"
-RESOURCES_DIR="$ROOT_DIR/ManeAI/ManePaw/Resources"
+RESOURCES_DIR="$ROOT_DIR/ManeAI/PandaIntelligence/Resources"
 NODE_VERSION="20.11.0"  # LTS version
 NODE_ARCH="arm64"       # Change to "x64" for Intel Macs
 
@@ -57,20 +57,20 @@ NODE_BINARY="$NODE_DIR/node"
 
 if [ ! -f "$NODE_BINARY" ]; then
     echo "📥 Downloading Node.js v$NODE_VERSION ($NODE_ARCH)..."
-    
+
     NODE_URL="https://nodejs.org/dist/v$NODE_VERSION/node-v$NODE_VERSION-darwin-$NODE_ARCH.tar.gz"
     TEMP_DIR=$(mktemp -d)
-    
+
     curl -L "$NODE_URL" -o "$TEMP_DIR/node.tar.gz"
     tar -xzf "$TEMP_DIR/node.tar.gz" -C "$TEMP_DIR"
-    
+
     # Copy only the node binary (not the entire runtime)
     cp "$TEMP_DIR/node-v$NODE_VERSION-darwin-$NODE_ARCH/bin/node" "$NODE_BINARY"
     chmod +x "$NODE_BINARY"
-    
+
     # Clean up
     rm -rf "$TEMP_DIR"
-    
+
     echo "✅ Node.js downloaded to $NODE_BINARY"
 else
     echo "✅ Node.js already present at $NODE_BINARY"
@@ -106,32 +106,32 @@ echo "✅ Sidecar built and copied"
 if [ -n "$SIGNING_IDENTITY" ]; then
     echo ""
     echo "🔏 Signing executables with: $SIGNING_IDENTITY"
-    
+
     # Sign Node.js binary
     echo "  Signing Node.js..."
     codesign --force --options runtime --sign "$SIGNING_IDENTITY" "$NODE_BINARY"
-    
+
     # Sign native modules in node_modules
     echo "  Signing native modules..."
-    
+
     # Find and sign all .node files (native modules)
     find "$RESOURCES_DIR/sidecar/node_modules" -name "*.node" -type f 2>/dev/null | while read -r module; do
         echo "    Signing: $(basename "$module")"
         codesign --force --options runtime --sign "$SIGNING_IDENTITY" "$module"
     done
-    
+
     # Find and sign any dylib files
     find "$RESOURCES_DIR/sidecar/node_modules" -name "*.dylib" -type f 2>/dev/null | while read -r dylib; do
         echo "    Signing: $(basename "$dylib")"
         codesign --force --options runtime --sign "$SIGNING_IDENTITY" "$dylib"
     done
-    
+
     # Sign any embedded executables
     find "$RESOURCES_DIR/sidecar/node_modules" -type f -perm +111 -name "*.bin" 2>/dev/null | while read -r bin; do
         echo "    Signing: $(basename "$bin")"
         codesign --force --options runtime --sign "$SIGNING_IDENTITY" "$bin"
     done
-    
+
     echo "✅ All executables signed"
 else
     echo ""

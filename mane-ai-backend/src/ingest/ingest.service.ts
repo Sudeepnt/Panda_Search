@@ -9,6 +9,9 @@ import {
 } from './dto/ingest.dto';
 import * as path from 'path';
 import * as fs from 'fs';
+import * as os from 'os';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const { PDFParse } = require('pdf-parse');
 import * as mammoth from 'mammoth';
@@ -17,13 +20,46 @@ import * as XLSX from 'xlsx';
 const CHUNK_WORD_COUNT = 280;
 const CHUNK_OVERLAP_WORDS = 50;
 const MIN_CONTENT_FOR_CHUNKING = 800;
+// Keep very large source/log files searchable without creating thousands of
+// Lance rows (the Finder table still represents one file). The first and last
+// chunks preserve headers and recent/footer information; the middle is
+// represented by a searchable marker.
+const MAX_CHUNKS_PER_FILE = 24;
 
 // Max file size for ingest (1GB) - applies to text, audio, and image files
 const MAX_FILE_SIZE_BYTES = 1024 * 1024 * 1024;
+const MAX_TEXT_BYTES_TO_INDEX = 8 * 1024 * 1024;
+const PDF_OCR_MIN_TEXT_CHARS = 24;
+const PDF_OCR_MAX_PAGES = 5;
 
 // Concurrency settings for parallel processing
 const DEFAULT_CONCURRENCY = 10; // Process 10 files in parallel
 const MAX_CONCURRENCY = 50; // Maximum parallel operations
+const execFileAsync = promisify(execFile);
+
+// Finder files that contain searchable text. Office/PDF formats have
+// dedicated extraction below; source/config formats are read as UTF-8.
+const INDEXABLE_TEXT_EXTENSIONS = new Set([
+  '.txt', '.md', '.markdown', '.csv', '.tsv', '.json', '.jsonl', '.ndjson',
+  '.xml', '.yaml', '.yml', '.toml', '.ini', '.conf', '.config', '.env', '.log',
+  '.sql', '.html', '.htm', '.css', '.scss', '.less', '.js', '.jsx', '.ts',
+  '.tsx', '.mjs', '.cjs', '.py', '.pyw', '.swift', '.m', '.h', '.c', '.cc',
+  '.cpp', '.cxx', '.hpp', '.java', '.kt', '.kts', '.go', '.rs', '.rb', '.php',
+  '.sh', '.bash', '.zsh', '.fish', '.graphql', '.gql', '.tex', '.rtf',
+  '.svelte', '.vue', '.astro', '.cu', '.cuh', '.wgsl', '.glsl', '.metal',
+  '.plist', '.strings', '.stringsdata', '.cmake', '.mk', '.make', '.lock',
+  '.properties', '.pbxproj', '.entitlements', '.ps1', '.bat', '.vim', '.nix',
+  '.jinja', '.jinja2', '.template', '.tmpl', '.example', '.inp', '.dia', '.d',
+  '.eml', '.msg', '.vcf', '.ics',
+]);
+
+// Binary/container formats still get a useful metadata record. Their bytes
+// are never sent through a UTF-8 decoder as if they were document text.
+const METADATA_ONLY_EXTENSIONS = new Set([
+  '.zip', '.rar', '.7z', '.tar', '.gz', '.tgz', '.bz2', '.xz', '.iso', '.dmg',
+  '.pkg', '.app', '.sqlite', '.db', '.bin', '.dat', '.pages', '.numbers', '.key',
+  '.psd', '.ai', '.eps', '.sketch', '.blend', '.fig', '.obj', '.stl', '.fbx', '.dwg', '.jar',
+]);
 
 @Injectable()
 export class IngestService {
@@ -50,10 +86,20 @@ export class IngestService {
       const end = Math.min(start + CHUNK_WORD_COUNT, words.length);
       const chunkWords = words.slice(start, end);
       chunks.push(chunkWords.join(' '));
+      // The final window already reaches EOF. Continuing with overlap would
+      // leave `start` unchanged and loop forever on any document longer than
+      // one chunk.
+      if (end >= words.length) break;
       start = end - CHUNK_OVERLAP_WORDS;
-      if (start >= words.length) break;
     }
-    return chunks;
+    if (chunks.length <= MAX_CHUNKS_PER_FILE) return chunks;
+    const headCount = Math.floor((MAX_CHUNKS_PER_FILE - 1) / 2);
+    const tailCount = MAX_CHUNKS_PER_FILE - 1 - headCount;
+    return [
+      ...chunks.slice(0, headCount),
+      '[middle content omitted from bounded index]',
+      ...chunks.slice(-tailCount),
+    ];
   }
 
   constructor(
@@ -63,6 +109,7 @@ export class IngestService {
   ) {}
 
   async ingestDocument(dto: IngestDocumentDto): Promise<IngestResponseDto> {
+    const startedAt = Date.now();
     try {
       this.logger.log(`Ingesting document: ${dto.filePath}`);
 
@@ -81,7 +128,34 @@ export class IngestService {
         dto.mediaType || this.multimodalService.getMediaType(dto.filePath);
       const fileName = path.basename(dto.filePath);
 
+      // Keep the backend idempotent for every supported type, not only
+      // images. The Swift cache is the fast path, but this guard also covers
+      // relaunches, overlapping scans, retries, and callers that talk to the
+      // API directly. A force reindex explicitly replaces the old record(s).
+      if (!dto.forceReindex && fs.existsSync(dto.filePath)) {
+        const existing = await this.lanceDBService.findDocumentByFilePath(dto.filePath);
+        if (existing) {
+          return {
+            id: existing.id,
+            fileName,
+            filePath: dto.filePath,
+            mediaType,
+            success: true,
+            message: `${mediaType.charAt(0).toUpperCase() + mediaType.slice(1)} already indexed`,
+            elapsedMs: Date.now() - startedAt,
+          };
+        }
+      }
+
+      // A Qwen re-index must replace the old fallback caption, never sit next
+      // to it as a duplicate vector record.
+      if (dto.forceReindex) {
+        await this.lanceDBService.deleteDocumentsByFilePath(dto.filePath);
+      }
+
       let id: string;
+      let imageTitle: string | undefined;
+      let imageDescription: string | undefined;
 
       if (mediaType === 'text') {
         // Text document - use content if provided, otherwise read from file
@@ -91,10 +165,9 @@ export class IngestService {
           const ext = path.extname(dto.filePath).toLowerCase();
 
           if (ext === '.pdf') {
-            // Extract text from PDF
-            const parser = new PDFParse({ url: dto.filePath });
-            const pdfData = await parser.getText();
-            content = pdfData.text;
+            // Extract normal PDF text, with a bounded OCR fallback for
+            // scanned/image-only invoices and receipts.
+            content = await this.extractPdfText(dto.filePath);
             this.logger.log(
               `Extracted ${content.length} chars from PDF: ${fileName}`,
             );
@@ -123,17 +196,25 @@ export class IngestService {
             const dataBuffer = await fs.promises.readFile(dto.filePath);
             content = `[document, file, presentation, slides, pptx format] PowerPoint presentation: ${fileName}. Contains slides and visual content.`;
             this.logger.log(`Indexed PowerPoint: ${fileName}`);
-          } else if (ext === '.doc' || ext === '.ppt' || ext === '.rtf') {
-            // Legacy formats - index filename with searchable terms
-            content = `[document, file, ${ext.replace('.', '')} format] Document file: ${fileName}. Legacy document format.`;
-            this.logger.log(`Indexed legacy document: ${fileName}`);
+          } else if (ext === '.rtf') {
+            content = this.extractRtfText(
+              await this.readTextFileSafely(dto.filePath),
+            );
+            this.logger.log(`Extracted ${content.length} chars from RTF: ${fileName}`);
+          } else if (['.doc', '.ppt', '.pages', '.numbers', '.key', '.odt'].includes(ext)) {
+            content = await this.extractTextWithTextUtil(dto.filePath).catch(() => '');
+            if (!content) content = this.metadataOnlyContent(dto.filePath);
+          } else if (METADATA_ONLY_EXTENSIONS.has(ext)) {
+            content = this.metadataOnlyContent(dto.filePath);
           } else {
-            content = await fs.promises.readFile(dto.filePath, 'utf-8');
+            content = INDEXABLE_TEXT_EXTENSIONS.has(ext)
+              ? await this.readTextFileSafely(dto.filePath)
+              : this.metadataOnlyContent(dto.filePath);
           }
         }
 
         if (!content) {
-          throw new Error('Content is required for text documents');
+          content = this.metadataOnlyContent(dto.filePath);
         }
 
         const ext =
@@ -159,6 +240,9 @@ export class IngestService {
           );
           const chunkMetadata = {
             ...dto.metadata,
+            mediaType: 'text',
+            fileExtension: ext,
+            indexingDurationMs: Date.now() - startedAt,
             ...(chunks.length > 1 && {
               chunkIndex: i,
               totalChunks: chunks.length,
@@ -197,20 +281,53 @@ export class IngestService {
         id = await this.lanceDBService.addTextDocument(
           enrichedContent,
           dto.filePath,
-          { ...dto.metadata, mediaType: 'audio' },
+          {
+            ...dto.metadata,
+            mediaType: 'audio',
+            fileExtension: path.extname(dto.filePath).toLowerCase().replace('.', ''),
+            indexingDurationMs: Date.now() - startedAt,
+          },
           undefined, // Re-embed with enriched content for better search
         );
       } else if (mediaType === 'image') {
-        // Image files - caption with Moondream, embed with MiniLM (384-dim)
+        // Image files - caption with Qwen-VL, then embed the rich caption.
         // Store in text table for unified text search
         if (!fs.existsSync(dto.filePath)) {
           throw new Error(`File not found: ${dto.filePath}`);
         }
 
-        // Generate detailed caption using Moondream vision model
-        const caption = await this.imageCaptioningService.generateCaption(
+        // The Swift cache normally prevents this branch from being reached a
+        // second time. Keep the backend idempotent as well so app relaunches,
+        // overlapping scans, or a retried HTTP request cannot create a second
+        // semantic row for the same unchanged path. A visual upgrade passes
+        // forceReindex=true and intentionally replaces the old caption.
+        if (!dto.forceReindex) {
+          const existing = await this.lanceDBService.findDocumentByFilePath(
+            dto.filePath,
+          );
+          if (existing) {
+            return {
+              id: existing.id,
+              fileName,
+              filePath: dto.filePath,
+              mediaType: 'image',
+              success: true,
+              message: 'Image already indexed',
+              elapsedMs: Date.now() - startedAt,
+            };
+          }
+        }
+
+        // Generate detailed caption using Panda's local Qwen vision model.
+        const imageIndex = await this.imageCaptioningService.generateImageIndexDescription(
           dto.filePath,
         );
+        imageTitle = imageIndex.title;
+        imageDescription = imageIndex.explanation;
+        const ocrText = dto.content?.trim();
+        const caption = ocrText
+          ? `${imageIndex.searchableText}\n\n[recognized text in image]\n${ocrText}`
+          : imageIndex.searchableText;
         this.logger.log(
           `Generated caption for ${fileName}: ${caption.substring(0, 100)}...`,
         );
@@ -219,7 +336,31 @@ export class IngestService {
         id = await this.lanceDBService.addTextDocument(caption, dto.filePath, {
           ...dto.metadata,
           mediaType: 'image',
+          fileExtension: path.extname(dto.filePath).toLowerCase().replace('.', ''),
+          indexingDurationMs: Date.now() - startedAt,
         });
+      } else if (mediaType === 'video') {
+        if (!fs.existsSync(dto.filePath)) {
+          throw new Error(`File not found: ${dto.filePath}`);
+        }
+        const previewPaths = await this.multimodalService.extractVideoPreviews(dto.filePath);
+        try {
+          const descriptions: string[] = [];
+          for (const [index, previewPath] of previewPaths.entries()) {
+            descriptions.push(`[representative video frame ${index + 1} of ${previewPaths.length}] ${await this.imageCaptioningService.generateCaption(previewPath)}`);
+          }
+          const localVision = dto.content?.trim();
+          const caption = `[video, movie, file, ${path.extname(dto.filePath).slice(1)} format, ${fileName}] Qwen visual understanding across the video:\n${descriptions.join('\n\n')}` +
+            (localVision ? `\n\n[local video understanding]\n${localVision}` : '');
+          id = await this.lanceDBService.addTextDocument(caption, dto.filePath, {
+            ...dto.metadata,
+            mediaType: 'video',
+            fileExtension: path.extname(dto.filePath).toLowerCase().replace('.', ''),
+            indexingDurationMs: Date.now() - startedAt,
+          });
+        } finally {
+          await Promise.all(previewPaths.map((previewPath) => fs.promises.unlink(previewPath).catch(() => undefined)));
+        }
       } else {
         throw new Error(`Unsupported media type: ${mediaType}`);
       }
@@ -231,6 +372,9 @@ export class IngestService {
         mediaType,
         success: true,
         message: `${mediaType.charAt(0).toUpperCase() + mediaType.slice(1)} "${fileName}" ingested successfully`,
+        imageTitle,
+        imageDescription,
+        elapsedMs: Date.now() - startedAt,
       };
     } catch (error: any) {
       this.logger.error(`Failed to ingest document: ${error.message}`);
@@ -293,6 +437,18 @@ export class IngestService {
     }
   }
 
+  async deduplicateImageDocuments(): Promise<number> {
+    return this.lanceDBService.deduplicateImageDocuments();
+  }
+
+  async pruneNonLocalDocuments(): Promise<number> {
+    return this.lanceDBService.pruneNonLocalDocuments();
+  }
+
+  async getIndexTimingSummary() {
+    return this.lanceDBService.getIndexTimingSummary();
+  }
+
   async getDocumentCount(): Promise<{ count: number }> {
     const count = await this.lanceDBService.getDocumentCount();
     return { count };
@@ -339,6 +495,7 @@ export class IngestService {
     const textFiles: IngestDocumentDto[] = [];
     const audioFiles: IngestDocumentDto[] = [];
     const imageFiles: IngestDocumentDto[] = [];
+    const videoFiles: IngestDocumentDto[] = [];
 
     for (const file of files) {
       const mediaType =
@@ -347,20 +504,23 @@ export class IngestService {
         audioFiles.push(file);
       } else if (mediaType === 'image') {
         imageFiles.push(file);
+      } else if (mediaType === 'video') {
+        videoFiles.push(file);
       } else {
         textFiles.push(file);
       }
     }
 
     // Process all types concurrently
-    const [textResults, audioResults, imageResults] = await Promise.all([
+    const [textResults, audioResults, imageResults, videoResults] = await Promise.all([
       this.processTextFilesConcurrent(textFiles, effectiveConcurrency),
       this.processMediaFilesConcurrent(audioFiles, 'audio', Math.max(1, Math.floor(effectiveConcurrency / 2))), // Audio is CPU-intensive
       this.processMediaFilesConcurrent(imageFiles, 'image', Math.max(1, Math.floor(effectiveConcurrency / 2))), // Image captioning is GPU-intensive
+      this.processMediaFilesConcurrent(videoFiles, 'video', 1), // Vision processing is memory-intensive
     ]);
 
     // Combine results
-    const results = [...textResults, ...audioResults, ...imageResults];
+    const results = [...textResults, ...audioResults, ...imageResults, ...videoResults];
     const success = results.filter((r) => r.success).length;
     const failed = results.filter((r) => !r.success).length;
     const elapsedMs = Date.now() - startTime;
@@ -386,7 +546,11 @@ export class IngestService {
     // First, extract content from all files in parallel
     const contentExtractions = await this.runWithConcurrency(
       files,
-      async (file) => this.extractTextContent(file),
+      async (file) => {
+        const startedAt = Date.now();
+        const extraction = await this.extractTextContent(file);
+        return { ...extraction, elapsedMs: Date.now() - startedAt };
+      },
       concurrency,
     );
 
@@ -429,6 +593,11 @@ export class IngestService {
           filePath: files[i].filePath,
           metadata: {
             ...files[i].metadata,
+            mediaType: 'text',
+            fileExtension: ext,
+            // Extraction is measured here; the shared batch embedding/write
+            // time is apportioned in the response returned to SwiftData.
+            indexingDurationMs: extraction.elapsedMs ?? 0,
             ...(chunks.length > 1 && {
               chunkIndex: j,
               totalChunks: chunks.length,
@@ -443,6 +612,7 @@ export class IngestService {
 
     // Batch insert all chunks at once
     let ids: string[] = [];
+    const batchStartedAt = Date.now();
     if (allChunks.length > 0) {
       ids = await this.lanceDBService.addTextDocumentsBatch(
         allChunks.map((c) => ({
@@ -452,6 +622,7 @@ export class IngestService {
         })),
       );
     }
+    const batchElapsedMs = Date.now() - batchStartedAt;
 
     // Build results
     const results: IngestResponseDto[] = [];
@@ -498,6 +669,10 @@ export class IngestService {
           chunkCount > 1
             ? `Indexed as ${chunkCount} chunks`
             : 'Ingested successfully',
+        // Extraction is measured per file; embedding/table-write time is
+        // shared by this batch and apportioned evenly for useful telemetry.
+        elapsedMs: (extraction.elapsedMs ?? 0) +
+          Math.round(batchElapsedMs / Math.max(1, files.length)),
       });
     }
 
@@ -528,9 +703,7 @@ export class IngestService {
         const ext = path.extname(dto.filePath).toLowerCase();
 
         if (ext === '.pdf') {
-          const parser = new PDFParse({ url: dto.filePath });
-          const pdfData = await parser.getText();
-          content = pdfData.text;
+          content = await this.extractPdfText(dto.filePath);
         } else if (ext === '.docx') {
           const result = await mammoth.extractRawText({ path: dto.filePath });
           content = result.value;
@@ -546,16 +719,24 @@ export class IngestService {
         } else if (ext === '.pptx') {
           const fileName = path.basename(dto.filePath);
           content = `[document, file, presentation, slides, pptx format] PowerPoint presentation: ${fileName}. Contains slides and visual content.`;
-        } else if (ext === '.doc' || ext === '.ppt' || ext === '.rtf') {
-          const fileName = path.basename(dto.filePath);
-          content = `[document, file, ${ext.replace('.', '')} format] Document file: ${fileName}. Legacy document format.`;
+        } else if (ext === '.rtf') {
+          content = this.extractRtfText(
+            await this.readTextFileSafely(dto.filePath),
+          );
+        } else if (['.doc', '.ppt', '.pages', '.numbers', '.key', '.odt'].includes(ext)) {
+          content = await this.extractTextWithTextUtil(dto.filePath).catch(() => '');
+          if (!content) content = this.metadataOnlyContent(dto.filePath);
+        } else if (METADATA_ONLY_EXTENSIONS.has(ext)) {
+          content = this.metadataOnlyContent(dto.filePath);
         } else {
-          content = await fs.promises.readFile(dto.filePath, 'utf-8');
+          content = INDEXABLE_TEXT_EXTENSIONS.has(ext)
+            ? await this.readTextFileSafely(dto.filePath)
+            : this.metadataOnlyContent(dto.filePath);
         }
       }
 
       if (!content) {
-        return { success: false, error: 'No content found' };
+        content = this.metadataOnlyContent(dto.filePath);
       }
 
       return { success: true, content };
@@ -564,12 +745,132 @@ export class IngestService {
     }
   }
 
+  /** Lightweight RTF-to-text extraction for local semantic indexing. */
+  private extractRtfText(rtf: string): string {
+    return rtf
+      .replace(/\\par[d]?/g, '\n')
+      .replace(/\\tab/g, '\t')
+      .replace(/\\'[0-9a-fA-F]{2}/g, (match) =>
+        String.fromCharCode(parseInt(match.slice(2), 16)),
+      )
+      .replace(/\\[a-zA-Z]+-?\d*\s?/g, '')
+      .replace(/[{}]/g, '')
+      .replace(/\\\\/g, '\\')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+  }
+
+  /** Extract legacy Office/Apple document text using the macOS textutil CLI. */
+  private async extractTextWithTextUtil(filePath: string): Promise<string> {
+    const result = await execFileAsync('/usr/bin/textutil', [
+      '-convert', 'txt', '-stdout', filePath,
+    ], { maxBuffer: 20 * 1024 * 1024 });
+    return String(result.stdout || '').trim();
+  }
+
   /**
-   * Process media files (audio/image) concurrently
+   * Extract searchable PDF text and OCR the first few pages when the PDF has
+   * no usable text layer. OCR is intentionally optional: Panda still indexes
+   * the filename/path if a minimal install does not include Poppler/Tesseract.
+   */
+  private async extractPdfText(filePath: string): Promise<string> {
+    const parser = new PDFParse({ url: filePath });
+    const pdfData = await parser.getText();
+    const extracted = String(pdfData.text || '').trim();
+    if (extracted.length >= PDF_OCR_MIN_TEXT_CHARS) return extracted;
+
+    const [pdftoppm, tesseract] = await Promise.all([
+      this.resolveExecutable('pdftoppm'),
+      this.resolveExecutable('tesseract'),
+    ]);
+    if (!pdftoppm || !tesseract) return extracted;
+
+    const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'panda-pdf-ocr-'));
+    const prefix = path.join(tempDir, 'page');
+    try {
+      await execFileAsync(pdftoppm, [
+        '-f', '1',
+        '-l', String(PDF_OCR_MAX_PAGES),
+        '-r', '160',
+        '-jpeg',
+        filePath,
+        prefix,
+      ], { maxBuffer: 2 * 1024 * 1024 });
+      const pageFiles = (await fs.promises.readdir(tempDir))
+        .filter((name) => /^page-\d+\.jpg$/i.test(name))
+        .sort()
+        .slice(0, PDF_OCR_MAX_PAGES);
+      const ocrPages: string[] = [];
+      for (const pageFile of pageFiles) {
+        try {
+          const result = await execFileAsync(tesseract, [
+            path.join(tempDir, pageFile),
+            'stdout',
+            '--psm', '6',
+          ], { maxBuffer: 4 * 1024 * 1024 });
+          const pageText = String(result.stdout || '').trim();
+          if (pageText) ocrPages.push(`[OCR page ${ocrPages.length + 1}]\n${pageText}`);
+        } catch (error: any) {
+          this.logger.warn(`PDF OCR page failed for ${path.basename(filePath)}: ${error.message}`);
+        }
+      }
+      const ocrText = ocrPages.join('\n\n').trim();
+      if (!ocrText) return extracted;
+      return [extracted, '[OCR text from scanned PDF]', ocrText]
+        .filter((part) => part.length > 0)
+        .join('\n\n');
+    } catch (error: any) {
+      this.logger.warn(`PDF OCR unavailable for ${path.basename(filePath)}: ${error.message}`);
+      return extracted;
+    } finally {
+      await fs.promises.rm(tempDir, { recursive: true, force: true }).catch(() => undefined);
+    }
+  }
+
+  private async resolveExecutable(command: string): Promise<string | null> {
+    try {
+      const result = await execFileAsync('/usr/bin/which', [command], { maxBuffer: 4096 });
+      const resolved = String(result.stdout || '').trim().split('\n')[0];
+      return resolved || null;
+    } catch {
+      return null;
+    }
+  }
+
+  private metadataOnlyContent(filePath: string): string {
+    const fileName = path.basename(filePath);
+    const ext = path.extname(filePath).toLowerCase().replace('.', '') || 'unknown';
+    return `[file, ${ext} format] File: ${fileName}. Binary/container content is indexed by filename, path, and format.`;
+  }
+
+  /** Read normal text fully, but bound huge logs/source files to head+tail. */
+  private async readTextFileSafely(filePath: string): Promise<string> {
+    const stats = await fs.promises.stat(filePath);
+    if (stats.size <= MAX_TEXT_BYTES_TO_INDEX) {
+      return fs.promises.readFile(filePath, 'utf-8');
+    }
+    const handle = await fs.promises.open(filePath, 'r');
+    try {
+      const segmentSize = Math.floor(MAX_TEXT_BYTES_TO_INDEX / 2);
+      const readAt = async (position: number) => {
+        const buffer = Buffer.alloc(segmentSize);
+        const result = await handle.read(buffer, 0, segmentSize, position);
+        return buffer.subarray(0, result.bytesRead).toString('utf8');
+      };
+      const head = await readAt(0);
+      const tail = await readAt(Math.max(0, stats.size - segmentSize));
+      return `${head}\n\n[content truncated for memory safety; tail follows]\n\n${tail}`;
+    } finally {
+      await handle.close();
+    }
+  }
+
+  /**
+   * Process media files (audio/image/video) concurrently
    */
   private async processMediaFilesConcurrent(
     files: IngestDocumentDto[],
-    mediaType: 'audio' | 'image',
+    mediaType: 'audio' | 'image' | 'video',
     concurrency: number,
   ): Promise<IngestResponseDto[]> {
     if (files.length === 0) return [];

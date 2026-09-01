@@ -3,6 +3,7 @@ import {
   Delete,
   Get,
   Param,
+  Post,
   HttpCode,
   HttpStatus,
 } from '@nestjs/common';
@@ -17,6 +18,26 @@ export class DocumentsController {
   @HttpCode(HttpStatus.OK)
   async listDocuments(): Promise<DocumentListResponseDto> {
     return this.ingestService.listDocuments();
+  }
+
+  @Post('deduplicate-images')
+  @HttpCode(HttpStatus.OK)
+  async deduplicateImages(): Promise<{ removed: number }> {
+    const removed = await this.ingestService.deduplicateImageDocuments();
+    return { removed };
+  }
+
+  @Post('prune-nonlocal')
+  @HttpCode(HttpStatus.OK)
+  async pruneNonLocal(): Promise<{ removed: number }> {
+    const removed = await this.ingestService.pruneNonLocalDocuments();
+    return { removed };
+  }
+
+  @Get('timings')
+  @HttpCode(HttpStatus.OK)
+  async indexTimings() {
+    return this.ingestService.getIndexTimingSummary();
   }
 
   @Delete('all')

@@ -58,6 +58,10 @@ DerivedData/
 test-db/
 **/Library/**/lancedb/
 
+# Local model weights and generated audit/build data
+mane-ai-backend/models/
+work/
+
 # Temporary files
 tmp/
 temp/

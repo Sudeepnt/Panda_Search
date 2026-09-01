@@ -34,12 +34,12 @@ export class ConfigService {
     this.ollamaUrl =
       ollamaUrlIndex !== -1 && args[ollamaUrlIndex + 1]
         ? args[ollamaUrlIndex + 1]
-        : 'http://localhost:11434';
+        : 'http://127.0.0.1:11434';
 
     this.ollamaModel =
       ollamaModelIndex !== -1 && args[ollamaModelIndex + 1]
         ? args[ollamaModelIndex + 1]
-        : 'qwen2.5';
+        : 'qwen3-vl:4b-instruct';
 
     this.port =
       portIndex !== -1 && args[portIndex + 1]

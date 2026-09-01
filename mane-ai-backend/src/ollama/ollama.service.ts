@@ -8,8 +8,6 @@ import {
 import { ConfigService } from '../config';
 import { LanceDBService } from '../lancedb';
 import { MultimodalService } from '../multimodal';
-import { ChatOllama } from '@langchain/ollama';
-import { HumanMessage, SystemMessage } from '@langchain/core/messages';
 
 type MediaType = 'text' | 'image' | 'audio';
 
@@ -32,7 +30,7 @@ interface StreamChunk {
 @Injectable()
 export class OllamaService implements OnModuleInit {
   private readonly logger = new Logger(OllamaService.name);
-  private chatModel: ChatOllama | null = null;
+  private modelName = '';
   private isOllamaAvailable = false;
 
   constructor(
@@ -50,11 +48,7 @@ export class OllamaService implements OnModuleInit {
     const ollamaUrl = this.configService.getOllamaUrl();
     const ollamaModel = this.configService.getOllamaModel();
 
-    this.chatModel = new ChatOllama({
-      baseUrl: ollamaUrl,
-      model: ollamaModel,
-      temperature: 0.7,
-    });
+    this.modelName = ollamaModel;
 
     // Check if Ollama is available
     await this.checkOllamaHealth();
@@ -63,8 +57,11 @@ export class OllamaService implements OnModuleInit {
   async checkOllamaHealth(): Promise<boolean> {
     try {
       const ollamaUrl = this.configService.getOllamaUrl();
-      const response = await fetch(`${ollamaUrl}/api/tags`);
-      this.isOllamaAvailable = response.ok;
+      const response = await fetch(`${ollamaUrl}/v1/models`);
+      const data = response.ok ? await response.json() : null;
+      this.isOllamaAvailable = Boolean(
+        data?.data?.some((model: { id: string }) => model.id === this.modelName),
+      );
 
       if (this.isOllamaAvailable) {
         this.logger.log('Ollama is available and ready');
@@ -83,7 +80,7 @@ export class OllamaService implements OnModuleInit {
   }
 
   async chat(query: string): Promise<ChatResponse> {
-    if (!this.chatModel) {
+    if (!this.modelName) {
       throw new Error('Chat model not initialized');
     }
 
@@ -118,14 +115,13 @@ export class OllamaService implements OnModuleInit {
     const systemPrompt = this.createSystemPrompt(context, stats);
 
     this.logger.log('Sending query to Ollama...');
-    const messages = [new SystemMessage(systemPrompt), new HumanMessage(query)];
+    const messages = [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: query },
+    ];
 
     try {
-      const response = await this.chatModel.invoke(messages);
-      const answer =
-        typeof response.content === 'string'
-          ? response.content
-          : JSON.stringify(response.content);
+      const answer = await this.complete(messages);
 
       this.logger.log('Response received from Ollama');
 
@@ -154,7 +150,7 @@ export class OllamaService implements OnModuleInit {
     void,
     unknown
   > {
-    if (!this.chatModel) {
+    if (!this.modelName) {
       throw new Error('Chat model not initialized');
     }
 
@@ -206,19 +202,14 @@ export class OllamaService implements OnModuleInit {
       : this.createSystemPrompt(context, stats);
 
     this.logger.log('Starting streaming response from Ollama...');
-    const messages = [new SystemMessage(systemPrompt), new HumanMessage(query)];
+    const messages = [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: query },
+    ];
 
     try {
-      const stream = await this.chatModel.stream(messages);
-
-      for await (const chunk of stream) {
-        const content =
-          typeof chunk.content === 'string'
-            ? chunk.content
-            : JSON.stringify(chunk.content);
-
-        yield { content, done: false };
-      }
+      const content = await this.complete(messages);
+      yield { content, done: false };
 
       // Send sources with the final done message
       yield { content: '', done: true, sources };
@@ -228,6 +219,27 @@ export class OllamaService implements OnModuleInit {
       this.isOllamaAvailable = false;
       throw new Error(`Failed to stream from Ollama: ${error.message}`);
     }
+  }
+
+  private async complete(
+    messages: Array<{ role: string; content: string }>,
+  ): Promise<string> {
+    const response = await fetch(
+      `${this.configService.getOllamaUrl()}/v1/chat/completions`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: this.modelName,
+          messages,
+          temperature: 0.7,
+          stream: false,
+        }),
+      },
+    );
+    if (!response.ok) throw new Error(await response.text());
+    const data = await response.json();
+    return data.choices?.[0]?.message?.content ?? '';
   }
 
   /**

@@ -1,6 +1,6 @@
 import { IsString, IsOptional, IsBoolean, IsArray } from 'class-validator';
 
-export type MediaType = 'text' | 'image' | 'audio';
+export type MediaType = 'text' | 'image' | 'audio' | 'video';
 
 export class ChatQueryDto {
   @IsString()

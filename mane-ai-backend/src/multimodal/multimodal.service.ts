@@ -17,7 +17,7 @@ interface TranscriptionResult {
   text: string;
 }
 
-export type MediaType = 'text' | 'image' | 'audio';
+export type MediaType = 'text' | 'image' | 'audio' | 'video';
 
 export interface ProcessedMedia {
   mediaType: MediaType;
@@ -37,20 +37,20 @@ export class MultimodalService implements OnModuleInit {
   readonly TEXT_DIMENSION = 384; // all-MiniLM-L6-v2
 
   // Supported file extensions
-  private readonly imageExtensions = ['.png', '.jpg', '.jpeg', '.gif', '.webp'];
-  private readonly audioExtensions = ['.mp3', '.wav', '.m4a', '.flac', '.ogg'];
+  private readonly imageExtensions = [
+    '.png', '.jpg', '.jpeg', '.gif', '.webp', '.heic', '.heif', '.tiff', '.bmp',
+    '.svg', '.ico', '.icns', '.avif', '.raw', '.cr2', '.cr3', '.nef', '.arw',
+    '.dng', '.orf', '.rw2', '.raf', '.pef', '.srw',
+  ];
+  private readonly audioExtensions = ['.mp3', '.wav', '.m4a', '.aac', '.flac', '.ogg', '.aiff', '.wma'];
+  private readonly videoExtensions = ['.mp4', '.mov', '.m4v', '.avi', '.mkv', '.webm'];
   private readonly textExtensions = [
-    '.txt',
-    '.md',
-    '.csv',
-    '.pdf',
-    '.docx',
-    '.doc',
-    '.xlsx',
-    '.xls',
-    '.pptx',
-    '.ppt',
-    '.rtf',
+    '.txt', '.md', '.markdown', '.csv', '.tsv', '.pdf', '.docx', '.doc', '.pages', '.odt', '.rtf', '.rtfd', '.epub', '.mobi',
+    '.xlsx', '.xls', '.xlsm', '.numbers', '.ods', '.pptx', '.ppt', '.key', '.odp',
+    '.json', '.jsonl', '.ndjson', '.xml', '.yaml', '.yml', '.toml', '.ini', '.conf', '.config', '.env', '.log', '.sql',
+    '.html', '.htm', '.css', '.scss', '.less', '.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs', '.py', '.pyw', '.swift',
+    '.m', '.h', '.c', '.cc', '.cpp', '.cxx', '.hpp', '.java', '.kt', '.kts', '.go', '.rs', '.rb', '.php', '.sh', '.bash', '.zsh', '.fish', '.graphql', '.gql', '.tex',
+    '.svelte', '.vue', '.astro', '.cu', '.cuh', '.wgsl', '.glsl', '.metal', '.plist', '.strings', '.stringsdata', '.cmake', '.mk', '.make', '.lock', '.properties', '.pbxproj', '.entitlements', '.ps1', '.bat', '.vim', '.nix', '.jinja', '.jinja2', '.template', '.tmpl', '.example', '.inp', '.dia', '.d', '.eml', '.msg', '.vcf', '.ics',
   ];
 
   async onModuleInit() {
@@ -67,6 +67,7 @@ export class MultimodalService implements OnModuleInit {
 
     if (this.imageExtensions.includes(ext)) return 'image';
     if (this.audioExtensions.includes(ext)) return 'audio';
+    if (this.videoExtensions.includes(ext)) return 'video';
     return 'text';
   }
 
@@ -130,6 +131,25 @@ export class MultimodalService implements OnModuleInit {
     }
   }
 
+  /** Export three points in a video so Qwen indexes more than its opening. */
+  async extractVideoPreviews(filePath: string): Promise<string[]> {
+    const id = `pandaintelligence_video_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    const outputDir = os.tmpdir();
+    return new Promise((resolve, reject) => {
+      ffmpeg(filePath)
+        .on('error', (error: Error) =>
+          reject(new Error(`Video frame extraction failed: ${error.message}`)),
+        )
+        .on('end', () => resolve(['10', '50', '90'].map((point) => path.join(outputDir, `${id}_${point}.jpg`))))
+        .screenshots({
+          timestamps: ['10%', '50%', '90%'],
+          filename: `${id}_%i.jpg`,
+          folder: outputDir,
+          size: '1024x?',
+        });
+    });
+  }
+
   /**
    * Get or initialize Whisper pipeline for audio transcription
    */
@@ -173,7 +193,9 @@ export class MultimodalService implements OnModuleInit {
       normalize: true,
     });
 
-    return Array.from(output.data);
+    const embedding = Array.from(output.data) as number[];
+    output.dispose?.();
+    return embedding;
   }
 
   /**

@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+      Panda Intelligence is a direct-distribution desktop app, not a Mac App Store
+      sandboxed app. This is required for macOS Full Disk Access to permit
+      indexing the local library after the user grants the TCC permission.
+    -->
+
+    <!-- Allow spawning the bundled Node.js sidecar -->
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <true/>
+
+    <!-- Disable library validation to allow Node.js native modules -->
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+</dict>
+</plist>

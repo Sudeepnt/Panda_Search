@@ -1,0 +1,6 @@
+allowBuilds:
+  '@ffmpeg-installer/darwin-arm64': true
+  '@nestjs/core': true
+  onnxruntime-node: true
+  protobufjs: true
+  sharp: true
