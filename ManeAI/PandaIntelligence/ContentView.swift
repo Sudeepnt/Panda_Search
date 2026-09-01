@@ -215,7 +215,7 @@ struct ContentView: View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 10) {
                 Image(systemName: results.isEmpty ? "magnifyingglass" : "sparkles").foregroundStyle(PandaPalette.mint)
-                Text(results.isEmpty ? "Search complete" : "Done — \(results.count) matching files found").font(.system(size: 16, weight: .semibold))
+                Text(results.isEmpty ? "Search complete" : "Done — \(results.count) relevant files found").font(.system(size: 16, weight: .semibold))
                 Spacer()
                 Image(systemName: results.isEmpty ? "minus.circle" : "checkmark.circle.fill").foregroundStyle(results.isEmpty ? .white.opacity(0.45) : PandaPalette.mint)
             }.padding(22)
@@ -224,10 +224,19 @@ struct ContentView: View {
                     .foregroundStyle(.white.opacity(0.55)).padding(.horizontal, 22).padding(.bottom, 22)
             } else {
                 Divider().overlay(.white.opacity(0.08))
-                ForEach(results.prefix(5)) { result in
-                    TaskResultRow(result: result)
-                    if result.id != results.prefix(5).last?.id { Divider().overlay(.white.opacity(0.07)).padding(.leading, 76) }
+                LazyVGrid(
+                    columns: [GridItem(.adaptive(minimum: 310), spacing: 14)],
+                    spacing: 14
+                ) {
+                    ForEach(results) { result in
+                        TaskResultRow(
+                            result: result,
+                            onOpen: { NSWorkspace.shared.open(URL(fileURLWithPath: result.filePath)) },
+                            onShowInFinder: { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: result.filePath)]) }
+                        )
+                    }
                 }
+                .padding(18)
             }
         }
         .frame(maxWidth: 760).background(PandaPalette.result, in: RoundedRectangle(cornerRadius: 24))
@@ -463,11 +472,11 @@ struct ContentView: View {
             brainStatus = modelStatus?.available == true
                 ? "Panda brain is understanding your files…"
                 : "Searching your local library…"
-            results = (try? await apiService.search(query: query, limit: 12).results) ?? []
+            results = (try? await apiService.search(query: query, limit: 50).results) ?? []
             await LocalVectorOperationGate.semaphore.signal()
             brainStatus = results.isEmpty
                 ? "Panda Intelligence is ready for your task"
-                : "Panda found \(results.count) matching file\(results.count == 1 ? "" : "s")"
+                : "Panda found \(results.count) relevant file\(results.count == 1 ? "" : "s")"
         }
     }
 }
@@ -527,7 +536,8 @@ private enum FullDiskAccess {
                 let excludedDirectoryNames: Set<String> = [
                     "Library", "node_modules", ".git", ".cache", ".npm", ".pnpm-store",
                     ".gemini", ".codex", ".antigravity", "DerivedData", "Pods", "Carthage", "Cache", "Caches",
-                    "frameThumbnail", "Proxy", "Temp", ".Trash", "CapCut", ".next", ".turbo",
+                    "frameThumbnail", "Proxy", "Temp", ".Trash", "CapCut", ".next", ".turbo", "work",
+                    ".build", ".swiftpm", "coverage",
                     "Photos Library.photoslibrary", "Photo Booth Library.photobooth",
                     "dist", "build", "out", "target", ".cargo", ".rustup", ".lmstudio",
                     ".venv", ".venv_paddlevl", "site-packages", ".Trashes", ".Spotlight-V100",
@@ -606,17 +616,76 @@ private extension Array {
 
 private struct TaskResultRow: View {
     let result: SearchResult
+    let onOpen: () -> Void
+    let onShowInFinder: () -> Void
+
+    private var summary: String {
+        let compact = result.content
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\r", with: " ")
+            .replacingOccurrences(of: "  ", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        // Backend records carry a compact metadata prefix for retrieval. The
+        // card should lead with the indexed explanation/transcript instead of
+        // repeating implementation details such as “document, pdf format”.
+        let withoutMetadata: String
+        if compact.hasPrefix("["), let closingBracket = compact.firstIndex(of: "]") {
+            withoutMetadata = String(compact[compact.index(after: closingBracket)...])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        } else {
+            withoutMetadata = compact
+        }
+        return withoutMetadata.isEmpty
+            ? "No indexed description is available for this file."
+            : String(withoutMetadata.prefix(360))
+    }
+
     var body: some View {
-        HStack(spacing: 15) {
-            LocalResultPreview(result: result)
-            VStack(alignment: .leading, spacing: 4) {
-                Text(result.fileName).font(.system(size: 15, weight: .semibold)).lineLimit(1)
-                Text(result.filePath).font(.system(size: 12)).foregroundStyle(.white.opacity(0.47)).lineLimit(1)
+        VStack(alignment: .leading, spacing: 13) {
+            HStack(alignment: .top, spacing: 12) {
+                LocalResultPreview(result: result)
+                    .frame(width: 58, height: 58)
+                VStack(alignment: .leading, spacing: 5) {
+                    Text(result.fileName)
+                        .font(.system(size: 15, weight: .semibold))
+                        .lineLimit(2)
+                    Text(result.filePath)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.white.opacity(0.47))
+                        .lineLimit(2)
+                        .textSelection(.enabled)
+                }
+                Spacer(minLength: 0)
             }
-            Spacer()
-            Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: result.filePath)]) }
-                .buttonStyle(.bordered).tint(PandaPalette.mint.opacity(0.55))
-        }.padding(18)
+
+            Text(summary)
+                .font(.system(size: 12))
+                .foregroundStyle(.white.opacity(0.62))
+                .lineLimit(4)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            Spacer(minLength: 0)
+            HStack(spacing: 9) {
+                Button(action: onOpen) {
+                    Label("Open", systemImage: "arrow.up.forward.app")
+                        .font(.system(size: 12, weight: .semibold))
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(PandaPalette.mint)
+
+                Button(action: onShowInFinder) {
+                    Label("Show in Finder", systemImage: "folder")
+                        .font(.system(size: 11, weight: .medium))
+                }
+                .buttonStyle(.bordered)
+                .tint(PandaPalette.mint.opacity(0.7))
+            }
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, minHeight: 220, alignment: .topLeading)
+        .background(PandaPalette.panel.opacity(0.72), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).stroke(.white.opacity(0.09)))
     }
 }
 

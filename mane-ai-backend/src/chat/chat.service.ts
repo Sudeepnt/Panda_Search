@@ -51,10 +51,18 @@ export class ChatService {
       `Processing search query: ${dto.query.substring(0, 50)}...`,
     );
 
-    // Use limit from DTO, default to 5. A value of 0 means return all results.
-    const limit = dto.limit === undefined ? 5 : dto.limit;
-
-    const results = await this.lanceDBService.hybridSearch(dto.query, limit);
+    // Retrieve a broad candidate window, then let the local language model
+    // judge relevance. The UI can display every selected file instead of
+    // showing an arbitrary five-row slice.
+    const limit = dto.limit === undefined ? 50 : dto.limit;
+    const candidateLimit = limit <= 0 ? 200 : Math.max(limit * 5, 50);
+    const candidates = await this.lanceDBService.hybridSearch(dto.query, candidateLimit);
+    const reasonedResults = await this.ollamaService.rerankSearchResults(
+      dto.query,
+      candidates,
+      limit,
+    );
+    const results = reasonedResults ?? (limit <= 0 ? candidates : candidates.slice(0, limit));
 
     return {
       results: results.map((r) => ({

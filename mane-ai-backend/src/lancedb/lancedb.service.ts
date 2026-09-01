@@ -101,6 +101,21 @@ export class LanceDBService implements OnModuleInit {
   // library scan.
   private textPathCacheLoading: Promise<void> | null = null;
 
+  // These directories contain generated/build/dependency data rather than
+  // user files. Older Panda versions indexed some of them before the scanner
+  // learned to skip them, so the same list is used by search and cleanup.
+  private readonly excludedPathComponents = new Set([
+    'Library', 'Applications', 'node_modules', '.git', '.cache', '.npm',
+    '.pnpm-store', '.gemini', '.codex', '.antigravity', 'DerivedData',
+    '.build', '.swiftpm', 'Pods', 'Carthage', 'Cache', 'Caches', 'dist',
+    'build', 'out', 'target', 'coverage', 'work', 'frameThumbnail',
+    'Proxy', 'Temp', '.Trash', '.Trashes', 'CapCut', '.next', '.turbo',
+    '.venv', '.venv_paddlevl', 'site-packages', '.lmstudio',
+    'Photos Library.photoslibrary', 'Photo Booth Library.photobooth',
+    '.Spotlight-V100', '.fseventsd', '.DocumentRevisions-V100',
+    '.TemporaryItems', 'CloudStorage', 'Mobile Documents',
+  ]);
+
   private readonly textTableName = 'documents_text';
   private readonly projectsTableName = 'projects';
   private readonly skeletonsTableName = 'code_skeletons';
@@ -138,6 +153,10 @@ export class LanceDBService implements OnModuleInit {
 
       // Initialize tables
       await this.initializeTables();
+
+      // Remove rows created by older scans before they can pollute the first
+      // search after an upgrade (for example Xcode DerivedData under work/).
+      await this.pruneNonLocalDocuments();
 
       this.logger.log('LanceDB initialized successfully');
     } catch (error) {
@@ -484,7 +503,10 @@ export class LanceDBService implements OnModuleInit {
     const queryVector = await this.generateEmbedding(query);
 
     // If limit is 0, return all results (use a very high number)
-    const effectiveLimit = limit <= 0 ? 10000 : limit;
+    // The vector search is filtered after reading because Lance's native
+    // vector query cannot express our path-component exclusions. Read a wide
+    // candidate window so generated rows do not crowd out real user files.
+    const effectiveLimit = limit <= 0 ? 100000 : Math.min(100000, Math.max(limit * 20, 1000));
 
     const results = await this.textTable
       .vectorSearch(queryVector)
@@ -505,23 +527,13 @@ export class LanceDBService implements OnModuleInit {
   private isSearchableUserFile(filePath: string): boolean {
     // Do not return transient screenshots or editor/video-cache artifacts that
     // were indexed by older builds. They are not part of the user's library.
-    const ignored = [
-      '/private/',
-      '/com.openai.sky.CUAService/',
-      '/CapCut/',
-      '/frameThumbnail/',
-      '/Library/Caches/',
-      '/Volumes/',
-      '/Network/',
-      '/Library/CloudStorage/',
-      '/Library/Mobile Documents/',
-    ];
     const homePath = process.env.HOME || '';
     const homePrefix = homePath && !homePath.endsWith(path.sep) ? homePath + path.sep : homePath;
-    return typeof filePath === 'string' &&
-      (!homePrefix || filePath.startsWith(homePrefix)) &&
-      !ignored.some((fragment) => filePath.includes(fragment)) &&
-      fs.existsSync(filePath);
+    if (typeof filePath !== 'string' ||
+      !homePrefix ||
+      !filePath.startsWith(homePrefix) ||
+      !fs.existsSync(filePath)) return false;
+    return !filePath.split(path.sep).some((component) => this.excludedPathComponents.has(component));
   }
 
   /**
@@ -602,10 +614,12 @@ export class LanceDBService implements OnModuleInit {
     // caption for that file.
     const rawVectorResults = await this.searchText(query, searchLimit);
     const byFilePath = new Map<string, SearchResult>();
+    const semanticScoreByPath = new Map<string, number>();
     for (const result of rawVectorResults) {
       const existing = byFilePath.get(result.filePath);
       if (!existing || result.score > existing.score) {
         byFilePath.set(result.filePath, result);
+        semanticScoreByPath.set(result.filePath, result.score);
       }
     }
     // Vector similarity is excellent for concepts but can miss a rare vendor
@@ -621,31 +635,50 @@ export class LanceDBService implements OnModuleInit {
     const vectorResults = Array.from(byFilePath.values());
 
     // Extract keywords for boosting exact matches
+    // Respect explicit media-type requests before semantic ranking. A text
+    // file can mention “panda” or “green” and still be a poor answer to
+    // “show images…”; returning it makes the result set look noisy even when
+    // its embedding is close. Keep the constraint narrow so an unconstrained
+    // concept query (for example, “files about a green panda”) can still
+    // return any useful file type.
     const isImageIntent = keywords.some((keyword) =>
-      ['image', 'images', 'photo', 'photos', 'picture', 'pictures'].includes(keyword),
+      ['image', 'images', 'photo', 'photos', 'picture', 'pictures', 'screenshot', 'screenshots'].includes(keyword),
+    );
+    const isAudioIntent = keywords.some((keyword) =>
+      ['audio', 'recording', 'recordings', 'podcast', 'podcasts', 'voice', 'voices', 'sound'].includes(keyword),
     );
 
-    // Score results with keyword boost
+    // Score results with a bounded lexical boost. The old additive scoring
+    // saturated at 1.0 whenever a common word such as "product" appeared,
+    // which made unrelated source files look as relevant as the real PDFs.
     const scoredResults = vectorResults.map((result) => {
-      let keywordScore = 0;
+      const semanticScore = Math.max(0, Math.min(1, semanticScoreByPath.get(result.filePath) ?? result.score));
+      const searchableText = `${result.content} ${result.fileName} ${result.filePath}`.toLowerCase();
+      // Count whole-word evidence for coverage. Substring matching is useful
+      // for ordinary filename boosts, but it makes a two-letter vendor token
+      // such as “RR” match unrelated words like “error” or “array”.
+      const matchedKeywords = keywords.filter((keyword) => {
+        const escaped = keyword.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        return new RegExp(`(^|[^a-z0-9])${escaped}(?=$|[^a-z0-9])`, 'i').test(searchableText);
+      });
+      const coverage = keywords.length === 0 ? 0 : matchedKeywords.length / keywords.length;
+      const meaningfulPhrase = keywords.join(' ');
+      const phraseMatch = meaningfulPhrase.length > 4 && searchableText.includes(meaningfulPhrase);
+      let lexicalScore = phraseMatch ? 1 : coverage;
+      if (matchedKeywords.some((keyword) => result.fileName.toLowerCase().includes(keyword))) {
+        lexicalScore = Math.min(1, lexicalScore + 0.18);
+      }
+      let keywordScore = lexicalScore * 0.42;
       let hasDirectVisualMatch = false;
       const contentLower = result.content.toLowerCase();
       const fileNameLower = result.fileName.toLowerCase();
 
       for (const keyword of keywords) {
-        // Exact keyword matches in content
-        if (contentLower.includes(keyword)) {
-          keywordScore += 0.1;
-        }
-        // Filename matches are more valuable
-        if (fileNameLower.includes(keyword)) {
-          keywordScore += 0.2;
-        }
-        // Boost for exact word boundaries
+        // A word-boundary match is a little stronger than a substring match,
+        // but never adds enough weight to drown out the semantic score.
         const wordBoundaryRegex = new RegExp(`\\b${keyword}\\b`, 'i');
-        if (wordBoundaryRegex.test(result.content)) {
-          keywordScore += 0.15;
-        }
+        if (wordBoundaryRegex.test(result.content)) keywordScore += 0.025;
+        if (fileNameLower.includes(keyword)) keywordScore += 0.04;
       }
 
       // A visual label is stronger evidence for an image request than a word
@@ -653,7 +686,7 @@ export class LanceDBService implements OnModuleInit {
       if (isImageIntent && result.mediaType === 'image') {
         const visualLabels = contentLower.match(/\[local visual labels\]([\s\S]*)/)?.[1] ?? '';
         if (keywords.some((keyword) => visualLabels.includes(keyword))) {
-          keywordScore += 0.65;
+          keywordScore += 0.35;
           hasDirectVisualMatch = true;
         }
         const isGenericScreenshot = /screenshot/.test(fileNameLower) &&
@@ -665,12 +698,28 @@ export class LanceDBService implements OnModuleInit {
 
       return {
         ...result,
-        score: Math.min(result.score + keywordScore, 1.0), // Cap at 1.0
+        score: Math.max(0, Math.min(1, semanticScore * 0.58 + keywordScore)),
         hasDirectVisualMatch,
+        keywordCoverage: coverage,
+        phraseMatch,
       };
     });
 
-    const sortedResults = scoredResults.sort((a, b) => {
+    // A natural-language query often contains only one or two meaningful
+    // terms after stop-word removal. Keep exact/near-exact matches and strong
+    // semantic matches, but drop weak vector neighbours before the optional
+    // local language-model reranker sees them.
+    const relevantResults = scoredResults.filter((result) => {
+      if (keywords.length === 0) return true;
+      if (isImageIntent && result.mediaType !== 'image') return false;
+      if (isAudioIntent && result.mediaType !== 'audio') return false;
+      const strongLexicalMatch = result.keywordCoverage >= 0.75 || result.phraseMatch;
+      const strongSemanticMatch = result.score >= 0.72 &&
+        (result.keywordCoverage >= 0.5 || result.mediaType === 'image');
+      return strongLexicalMatch || strongSemanticMatch;
+    });
+
+    const sortedResults = relevantResults.sort((a, b) => {
       if (a.hasDirectVisualMatch !== b.hasDirectVisualMatch) {
         return a.hasDirectVisualMatch ? -1 : 1;
       }
@@ -683,7 +732,21 @@ export class LanceDBService implements OnModuleInit {
 
   /** Return normalized query tokens once, keeping punctuation out of exact matching. */
   private queryKeywords(query: string): string[] {
-    return query.toLowerCase().split(/\s+/).map((token) => token.replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, '')).filter((token) => token.length > 2);
+    const stopWords = new Set([
+      'a', 'an', 'and', 'anything', 'are', 'about', 'be', 'can', 'contains',
+      'contain', 'containing', 'document', 'documents', 'file', 'files', 'find', 'for',
+      'from', 'give', 'get', 'i', 'in', 'is', 'it', 'me', 'my', 'of', 'on',
+      'or', 'please', 'related', 'relation', 'search', 'show', 'something',
+      'that', 'the', 'these', 'this', 'those', 'to', 'type', 'types', 'want',
+      'what', 'where', 'which', 'with', 'you',
+    ]);
+    return query
+      .toLowerCase()
+      .split(/\s+/)
+      .map((token) => token.replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, ''))
+      // Keep two-letter acronyms such as "RR"; they are often the most
+      // important part of an invoice/vendor query.
+      .filter((token) => token.length >= 2 && !stopWords.has(token));
   }
 
   private async searchExactKeywords(query: string, keywords: string[]): Promise<SearchResult[]> {
@@ -918,15 +981,10 @@ export class LanceDBService implements OnModuleInit {
         .toArray()) as any[];
       const homePath = process.env.HOME || '';
       const homePrefix = homePath && !homePath.endsWith(path.sep) ? homePath + path.sep : homePath;
-      const excludedDirectoryNames = new Set([
-        'Library', 'Applications', 'node_modules', '.git', '.cache', '.npm', '.pnpm-store',
-        'DerivedData', 'Caches', 'Cache', 'CapCut', 'frameThumbnail', 'Photos Library.photoslibrary',
-        'Photo Booth Library.photobooth', '.Trash', '.Trashes', '.Spotlight-V100', '.fseventsd',
-      ]);
       const idsToRemove = rows
         .filter((row) => {
           if (typeof row.filePath !== 'string' || (homePrefix && !row.filePath.startsWith(homePrefix))) return true;
-          return row.filePath.split(path.sep).some((component: string) => excludedDirectoryNames.has(component));
+          return row.filePath.split(path.sep).some((component: string) => this.excludedPathComponents.has(component));
         })
         .map((row) => String(row.id));
       for (let index = 0; index < idsToRemove.length; index += 100) {
@@ -1008,16 +1066,18 @@ export class LanceDBService implements OnModuleInit {
       return [];
     }
 
-    const textDocs = await this.textTable.query().limit(1000).toArray();
-    return textDocs.map((row: any) => ({
-      id: row.id,
-      content: row.content,
-      filePath: row.filePath,
-      fileName: row.fileName,
-      mediaType: row.mediaType || 'text',
-      metadata: this.parseMetadata(row.metadata),
-      score: 1,
-    }));
+    const textDocs = await this.textTable.query().limit(100000).toArray();
+    return textDocs
+      .filter((row: any) => this.isSearchableUserFile(row.filePath))
+      .map((row: any) => ({
+        id: row.id,
+        content: row.content,
+        filePath: row.filePath,
+        fileName: row.fileName,
+        mediaType: row.mediaType || 'text',
+        metadata: this.parseMetadata(row.metadata),
+        score: 1,
+      }));
   }
 
   /**

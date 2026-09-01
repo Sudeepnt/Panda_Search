@@ -32,6 +32,9 @@ export class OllamaService implements OnModuleInit {
   private readonly logger = new Logger(OllamaService.name);
   private modelName = '';
   private isOllamaAvailable = false;
+  private reasoningHealthCheckedAt = 0;
+  private reasoningHealthAvailable = false;
+  private reasoningModelName = '';
 
   constructor(
     private readonly configService: ConfigService,
@@ -278,6 +281,163 @@ export class OllamaService implements OnModuleInit {
       this.logger.warn(`Search failed: ${err.message}`);
       return [];
     }
+  }
+
+  /**
+   * Let the local language model judge candidate files after vector and
+   * lexical retrieval. Embeddings are good at finding a broad neighborhood,
+   * but a reasoning pass removes generic neighbors that only share common
+   * words with the request.
+   *
+   * This is optional: when no local OpenAI-compatible model is reachable,
+   * callers receive null and keep the deterministic ranked list.
+   */
+  async rerankSearchResults<T extends {
+    id: string;
+    content: string;
+    filePath: string;
+    fileName: string;
+    mediaType: string;
+    score: number;
+  }>(query: string, candidates: T[], maxResults: number): Promise<T[] | null> {
+    if (candidates.length === 0) return [];
+
+    const health = await this.checkReasoningHealth();
+    if (!health.available) return null;
+
+    // Keep the prompt bounded. Retrieval can use a larger candidate window so
+    // the model can choose all relevant files without receiving thousands of
+    // document chunks at once.
+    const judgedCandidates = candidates.slice(0, 8);
+    const candidateText = judgedCandidates.map((candidate, index) => {
+      const content = String(candidate.content || '').replace(/\s+/g, ' ').slice(0, 80);
+      return `${index}. FILE: ${candidate.fileName}\nPATH: ${candidate.filePath}\nTYPE: ${candidate.mediaType}\nCONTENT: ${content}`;
+    }).join('\n\n---\n\n');
+
+    const prompt = `You are Panda's local file-search relevance judge. Think carefully about the user's request and select every candidate that is genuinely related. A file is relevant only when its filename, path, or content provides direct evidence for the requested subject. Reject generic neighbors that only share common words. Keep separate versions when each is meaningfully related. Do not invent facts.
+
+USER REQUEST:
+${query}
+
+CANDIDATE FILES:
+${candidateText}
+
+Return ONLY valid JSON in this exact shape (no markdown):
+[{"index":0,"relevant":true,"score":0.95,"reason":"short evidence"}]
+Include one object for each candidate. score must be 0 to 1. Use relevant=false for unrelated files.`;
+
+    try {
+      const response = await fetch(`${health.url}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        signal: AbortSignal.timeout(30000),
+        body: JSON.stringify({
+          model: health.model,
+          temperature: 0,
+          max_tokens: Math.min(300, Math.max(180, judgedCandidates.length * 20)),
+          messages: [{ role: 'user', content: prompt }],
+        }),
+      });
+      if (!response.ok) throw new Error(await response.text());
+      const payload = await response.json();
+      const raw = String(payload.choices?.[0]?.message?.content || '').trim();
+      const jsonMatch = raw.match(/\[[\s\S]*\]/);
+      if (!jsonMatch) throw new Error('Reasoning model returned no JSON array');
+      const decisions = JSON.parse(jsonMatch[0]) as Array<{
+        index?: number;
+        relevant?: boolean;
+        score?: number;
+        reason?: string;
+      }>;
+      if (!Array.isArray(decisions)) throw new Error('Reasoning model returned invalid JSON');
+
+      const ranked = decisions
+        .filter((decision) => Number.isInteger(decision.index) &&
+          (decision.index as number) >= 0 &&
+          (decision.index as number) < judgedCandidates.length &&
+          decision.relevant !== false &&
+          Number(decision.score) >= 0.45)
+        .sort((a, b) => Number(b.score) - Number(a.score))
+        .map((decision) => {
+          const candidate = judgedCandidates[decision.index as number];
+          return {
+            ...candidate,
+            // Preserve a strong deterministic retrieval score when it is
+            // higher; the model controls ordering and relevance filtering.
+            score: Math.max(candidate.score, Math.min(1, Number(decision.score))),
+          };
+        });
+
+      if (ranked.length === 0) return null;
+
+      // Never hide a strong filename hit merely because the language model
+      // was conservative. This protects versioned files such as
+      // BOUGHT-3.pdf and 2-BOUGHT-beef-revision.pdf while avoiding generic
+      // filename terms like "product" and "document".
+      const rankedIds = new Set(ranked.map((candidate) => candidate.id));
+      const directTokens = this.rerankQueryTokens(query);
+      const directFilenameMatches = candidates
+        .filter((candidate) => !rankedIds.has(candidate.id))
+        .filter((candidate) => {
+          const haystack = `${candidate.fileName} ${candidate.filePath}`.toLowerCase();
+          return directTokens.some((token) => haystack.includes(token));
+        })
+        .sort((a, b) => b.score - a.score);
+      const combined = [...ranked, ...directFilenameMatches];
+      return maxResults <= 0 ? combined : combined.slice(0, maxResults);
+    } catch (error: any) {
+      this.logger.warn(`Local reasoning rerank unavailable: ${error.message}`);
+      this.reasoningHealthAvailable = false;
+      this.reasoningHealthCheckedAt = Date.now();
+      return null;
+    }
+  }
+
+  private async checkReasoningHealth(): Promise<{ available: boolean; url: string; model: string }> {
+    const now = Date.now();
+    if (now - this.reasoningHealthCheckedAt < 15000) {
+      return {
+        available: this.reasoningHealthAvailable,
+        url: this.reasoningUrl(),
+        model: this.reasoningModelName || this.modelName,
+      };
+    }
+
+    const url = this.reasoningUrl();
+    try {
+      const response = await fetch(`${url}/v1/models`, { signal: AbortSignal.timeout(1500) });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const payload = await response.json();
+      const models = Array.isArray(payload.data) ? payload.data : (Array.isArray(payload.models) ? payload.models : []);
+      const availableModel = models.find((model: any) => typeof model?.id === 'string')?.id || '';
+      this.reasoningModelName = availableModel || this.modelName;
+      this.reasoningHealthAvailable = Boolean(this.reasoningModelName);
+    } catch {
+      this.reasoningHealthAvailable = false;
+      this.reasoningModelName = '';
+    }
+    this.reasoningHealthCheckedAt = now;
+    return { available: this.reasoningHealthAvailable, url, model: this.reasoningModelName || this.modelName };
+  }
+
+  private reasoningUrl(): string {
+    // Panda's bundled Qwen-VL server is OpenAI-compatible and can also judge
+    // text-only search candidates. Ollama remains the fallback for installs
+    // that provide their own local chat model.
+    return process.env.PANDA_REASONING_URL || process.env.PANDA_VISION_URL || 'http://127.0.0.1:8081';
+  }
+
+  private rerankQueryTokens(query: string): string[] {
+    const generic = new Set([
+      'about', 'content', 'data', 'document', 'documents', 'file', 'files',
+      'find', 'image', 'images', 'photo', 'photos', 'picture', 'pictures',
+      'product', 'products', 'related', 'search', 'show', 'text', 'thing',
+      'types',
+    ]);
+    return query.toLowerCase()
+      .split(/\s+/)
+      .map((token) => token.replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, ''))
+      .filter((token) => token.length >= 4 && !generic.has(token));
   }
 
   /**
