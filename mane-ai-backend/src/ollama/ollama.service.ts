@@ -305,10 +305,13 @@ export class OllamaService implements OnModuleInit {
     const health = await this.checkReasoningHealth();
     if (!health.available) return null;
 
-    // Keep the prompt bounded. Retrieval can use a larger candidate window so
-    // the model can choose all relevant files without receiving thousands of
-    // document chunks at once.
-    const judgedCandidates = candidates.slice(0, 8);
+    // Judge the complete result window requested by the caller. The previous
+    // eight-item cap meant an available reasoning model could silently hide
+    // related files even though hybrid retrieval had already found them. Keep
+    // the unbounded API mode safe by capping one prompt at 50 files; normal UI
+    // searches request 50 and therefore receive the full result window.
+    const judgeLimit = maxResults <= 0 ? 50 : Math.min(maxResults, 50);
+    const judgedCandidates = candidates.slice(0, Math.min(candidates.length, Math.max(8, judgeLimit)));
     const candidateText = judgedCandidates.map((candidate, index) => {
       const content = String(candidate.content || '').replace(/\s+/g, ' ').slice(0, 80);
       return `${index}. FILE: ${candidate.fileName}\nPATH: ${candidate.filePath}\nTYPE: ${candidate.mediaType}\nCONTENT: ${content}`;
@@ -334,7 +337,7 @@ Include one object for each candidate. score must be 0 to 1. Use relevant=false 
         body: JSON.stringify({
           model: health.model,
           temperature: 0,
-          max_tokens: Math.min(300, Math.max(180, judgedCandidates.length * 20)),
+          max_tokens: Math.min(1600, Math.max(240, judgedCandidates.length * 20)),
           messages: [{ role: 'user', content: prompt }],
         }),
       });
