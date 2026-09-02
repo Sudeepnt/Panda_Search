@@ -229,7 +229,10 @@ struct ContentView: View {
                             starterCard
                         }
                     }
-                    .frame(maxWidth: 900).padding(.horizontal, 42).padding(.bottom, 150)
+                    // Search results are a Finder-like workspace, not a
+                    // narrow chat bubble. Let the grid use the available
+                    // Mac window while retaining comfortable side margins.
+                    .frame(maxWidth: 1280).padding(.horizontal, 42).padding(.bottom, 150)
                 }
                 .scrollIndicators(.hidden)
             }
@@ -280,13 +283,14 @@ struct ContentView: View {
             } else {
                 Divider().overlay(.white.opacity(0.08))
                 LazyVGrid(
-                    columns: [GridItem(.adaptive(minimum: 310), spacing: 14)],
+                    columns: resultGridColumns,
                     spacing: 14
                 ) {
                     ForEach(Array(results.enumerated()), id: \.element.id) { index, result in
                         TaskResultRow(
                             result: result,
                             serial: index + 1,
+                            isExpanded: results.count == 1,
                             onOpen: { NSWorkspace.shared.open(URL(fileURLWithPath: result.filePath)) },
                             onShowInFinder: { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: result.filePath)]) },
                             onAction: { action in handleResultAction(action, result: result, serial: index + 1) }
@@ -296,8 +300,21 @@ struct ContentView: View {
                 .padding(18)
             }
         }
-        .frame(maxWidth: 760).background(PandaPalette.result, in: RoundedRectangle(cornerRadius: 24))
+        .frame(maxWidth: 1280).background(PandaPalette.result, in: RoundedRectangle(cornerRadius: 24))
         .overlay(RoundedRectangle(cornerRadius: 24).stroke(.white.opacity(0.1)))
+    }
+
+    private var resultGridColumns: [GridItem] {
+        switch results.count {
+        case 1:
+            // A single result should occupy the workspace rather than leaving
+            // an empty second column beside it.
+            return [GridItem(.flexible())]
+        case 2:
+            return Array(repeating: GridItem(.flexible(minimum: 280), spacing: 14), count: 2)
+        default:
+            return [GridItem(.adaptive(minimum: 320, maximum: 420), spacing: 14)]
+        }
     }
 
     private var promptBar: some View {
@@ -1351,9 +1368,12 @@ private enum FinderActionError: LocalizedError {
 private struct TaskResultRow: View {
     let result: SearchResult
     let serial: Int
+    let isExpanded: Bool
     let onOpen: () -> Void
     let onShowInFinder: () -> Void
     let onAction: (ResultCardAction) -> Void
+
+    private var previewSize: CGFloat { isExpanded ? 132 : 64 }
 
     private var summary: String {
         let compact = result.content
@@ -1361,6 +1381,12 @@ private struct TaskResultRow: View {
             .replacingOccurrences(of: "\r", with: " ")
             .replacingOccurrences(of: "  ", with: " ")
             .trimmingCharacters(in: .whitespacesAndNewlines)
+        // Restored image history deliberately contains only the local path
+        // and filename. The filename is already shown in the title, and the
+        // match explanation is more useful than repeating it as body text.
+        if compact.hasPrefix("[saved image result]") {
+            return ""
+        }
         // Backend records carry a compact metadata prefix for retrieval. The
         // card should lead with the indexed explanation/transcript instead of
         // repeating implementation details such as “document, pdf format”.
@@ -1373,15 +1399,14 @@ private struct TaskResultRow: View {
         }
         return withoutMetadata.isEmpty
             ? "No indexed description is available for this file."
-            : String(withoutMetadata.prefix(360))
+            : String(withoutMetadata.prefix(isExpanded ? 260 : 190))
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 13) {
             HStack(alignment: .top, spacing: 12) {
                 ZStack(alignment: .bottomTrailing) {
-                    LocalResultPreview(result: result)
-                        .frame(width: 58, height: 58)
+                    LocalResultPreview(result: result, size: previewSize)
                     Text("\(serial)")
                         .font(.system(size: 10, weight: .bold, design: .rounded))
                         .foregroundStyle(PandaPalette.canvas)
@@ -1392,13 +1417,8 @@ private struct TaskResultRow: View {
                 }
                 VStack(alignment: .leading, spacing: 5) {
                     Text(result.fileName)
-                        .font(.system(size: 15, weight: .semibold))
+                        .font(.system(size: isExpanded ? 17 : 15, weight: .semibold))
                         .lineLimit(2)
-                    Text(result.filePath)
-                        .font(.system(size: 11))
-                        .foregroundStyle(.white.opacity(0.47))
-                        .lineLimit(2)
-                        .textSelection(.enabled)
                 }
                 Spacer(minLength: 0)
             }
@@ -1408,18 +1428,20 @@ private struct TaskResultRow: View {
                 Label(matchReason, systemImage: "sparkle.magnifyingglass")
                     .font(.system(size: 11, weight: .medium))
                     .foregroundStyle(PandaPalette.mint.opacity(0.9))
-                    .lineLimit(3)
+                    .lineLimit(2)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.horizontal, 10)
                     .padding(.vertical, 8)
                     .background(PandaPalette.mint.opacity(0.08), in: RoundedRectangle(cornerRadius: 9))
             }
 
-            Text(summary)
-                .font(.system(size: 12))
-                .foregroundStyle(.white.opacity(0.62))
-                .lineLimit(4)
-                .frame(maxWidth: .infinity, alignment: .leading)
+            if !summary.isEmpty {
+                Text(summary)
+                    .font(.system(size: 12))
+                    .foregroundStyle(.white.opacity(0.62))
+                    .lineLimit(isExpanded ? 3 : 2)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
 
             Spacer(minLength: 0)
             HStack(spacing: 9) {
@@ -1462,7 +1484,7 @@ private struct TaskResultRow: View {
             }
         }
         .padding(16)
-        .frame(maxWidth: .infinity, minHeight: 220, alignment: .topLeading)
+        .frame(maxWidth: .infinity, minHeight: isExpanded ? 230 : 185, alignment: .topLeading)
         .background(PandaPalette.panel.opacity(0.72), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).stroke(.white.opacity(0.09)))
     }
@@ -1678,6 +1700,7 @@ private struct LocalImageThumbnail: View {
 
 private struct LocalResultPreview: View {
     let result: SearchResult
+    var size: CGFloat = 58
 
     var body: some View {
         Group {
@@ -1694,10 +1717,10 @@ private struct LocalResultPreview: View {
                     .background(PandaPalette.mint.opacity(0.15))
             }
         }
-        .frame(width: 58, height: 58)
+        .frame(width: size, height: size)
         .background(PandaPalette.mint.opacity(0.15))
-        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 12).stroke(.white.opacity(0.1)))
+        .clipShape(RoundedRectangle(cornerRadius: min(size / 5, 14), style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: min(size / 5, 14)).stroke(.white.opacity(0.1)))
     }
 }
 
