@@ -5,7 +5,7 @@ import ImageIO
 
 /// The normal Panda Intelligence app window. Ctrl+W still opens the compact quick-search overlay.
 struct ContentView: View {
-    private static let currentFullContentIndexVersion = 2
+    private static let currentFullContentIndexVersion = 3
     @EnvironmentObject var apiService: APIService
     @EnvironmentObject var indexingService: DocumentIndexingService
     @EnvironmentObject var fileMonitoringService: FileMonitoringService
@@ -319,7 +319,8 @@ struct ContentView: View {
                 isIndexingLibrary = false
                 qwenVisualIndexVersion = 1
             }
-            guard fullContentIndexVersion < Self.currentFullContentIndexVersion else { return }
+            let needsTextIndexUpgrade = fullContentIndexVersion < Self.currentFullContentIndexVersion
+            guard needsTextIndexUpgrade else { return }
             if !imageScanSessionPrepared {
                 // A visual pass is resumable. Existing rows with a completed
                 // title + explanation are retained, while rows without those
@@ -334,7 +335,13 @@ struct ContentView: View {
             // until their dedicated frame/transcript pipeline is enabled.
             for root in FullDiskAccess.finderRoots() {
                 if Task.isCancelled { break }
-                await index(folder: root, usesSecurityBookmark: false, reindexVisualMedia: false, imageOnly: false)
+                await index(
+                    folder: root,
+                    usesSecurityBookmark: false,
+                    reindexVisualMedia: false,
+                    imageOnly: false,
+                    forceTextReindex: needsTextIndexUpgrade
+                )
             }
             if !Task.isCancelled && indexingService.lastScanFailureCount == 0 {
                 await retryIncompleteImages()
@@ -348,7 +355,13 @@ struct ContentView: View {
         }
     }
 
-    private func index(folder: URL, usesSecurityBookmark: Bool, reindexVisualMedia: Bool = false, imageOnly: Bool = false) async {
+    private func index(
+        folder: URL,
+        usesSecurityBookmark: Bool,
+        reindexVisualMedia: Bool = false,
+        imageOnly: Bool = false,
+        forceTextReindex: Bool = false
+    ) async {
         isIndexingLibrary = true
         defer { isIndexingLibrary = false }
         libraryStatus = "Finding files…"
@@ -393,12 +406,17 @@ struct ContentView: View {
         if usesSecurityBookmark {
             do {
                 let urls = try SecurityBookmarks.shared.listFilesRecursively(in: folder, extensions: Array(extensions))
-                await index(urls: urls)
+                await index(urls: urls, forceTextReindex: forceTextReindex)
             } catch {
                 libraryStatus = "Could not read \(folder.lastPathComponent)"
             }
         } else {
-            await indexFullDisk(from: folder, extensions: extensions, reindexVisualMedia: reindexVisualMedia)
+            await indexFullDisk(
+                from: folder,
+                extensions: extensions,
+                reindexVisualMedia: reindexVisualMedia,
+                forceTextReindex: forceTextReindex
+            )
         }
     }
 
@@ -414,7 +432,7 @@ struct ContentView: View {
         await LocalVectorOperationGate.semaphore.signal()
     }
 
-    private func index(urls: [URL]) async {
+    private func index(urls: [URL], forceTextReindex: Bool = false) async {
         guard !urls.isEmpty else {
             libraryStatus = "No supported files found"
             return
@@ -423,13 +441,22 @@ struct ContentView: View {
         var completed = 0
         for batch in urls.chunked(into: 24) {
             libraryStatus = "Indexing \(completed + 1)–\(min(completed + batch.count, urls.count)) of \(urls.count) files"
-            _ = await indexingService.indexFilesIfNeededConcurrent(batch, maxConcurrency: 4)
+            _ = await indexingService.indexFilesIfNeededConcurrent(
+                batch,
+                maxConcurrency: 4,
+                forceTextReindex: forceTextReindex
+            )
             completed += batch.count
         }
         libraryStatus = "Indexed \(completed) files"
     }
 
-    private func indexFullDisk(from root: URL, extensions: Set<String>, reindexVisualMedia: Bool) async {
+    private func indexFullDisk(
+        from root: URL,
+        extensions: Set<String>,
+        reindexVisualMedia: Bool,
+        forceTextReindex: Bool = false
+    ) async {
         var discovered = 0
         var indexed = 0
         var unavailableLocations = 0
@@ -449,7 +476,12 @@ struct ContentView: View {
                 ? "Qwen is understanding \(batch[0].lastPathComponent)…"
                 : "Indexing \(indexed + 1)–\(indexed + batch.count) (\(discovered) found): \(batch[0].lastPathComponent)"
             await LocalVectorOperationGate.semaphore.wait()
-            let results = await indexingService.indexFilesIfNeededConcurrent(batch, maxConcurrency: 8, forceReindex: shouldReplaceFallbackCaption)
+            let results = await indexingService.indexFilesIfNeededConcurrent(
+                batch,
+                maxConcurrency: 8,
+                forceReindex: shouldReplaceFallbackCaption,
+                forceTextReindex: forceTextReindex
+            )
             indexingService.lastScanFailureCount += results.filter { !$0.isSuccess }.count
             await LocalVectorOperationGate.semaphore.signal()
             indexed += batch.count

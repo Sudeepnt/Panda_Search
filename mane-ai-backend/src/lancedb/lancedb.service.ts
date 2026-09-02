@@ -54,6 +54,16 @@ export interface SearchResult {
   thumbnailPath?: string;
   metadata: Record<string, unknown>;
   score: number;
+  /**
+   * Search-only evidence assembled from every chunk of a file. Keeping this
+   * separate from `content` lets ranking see the whole document while the UI
+   * still receives a short, useful result preview.
+   */
+  searchEvidence?: string;
+  /** Weighted coverage of explicit query phrases (multi-word concepts count
+   * more than a single generic token). Used only for deterministic ranking. */
+  phraseCoverage?: number;
+  phraseMatchCount?: number;
 }
 
 export interface ProjectSearchResult {
@@ -627,10 +637,21 @@ export class LanceDBService implements OnModuleInit {
     // projected text columns so exact invoice/seller names are guaranteed to
     // surface, while still collapsing chunks to one file result.
     const keywords = this.queryKeywords(query);
-    const exactResults = await this.searchExactKeywords(query, keywords);
+    const phrases = this.queryPhrases(query);
+    const exactResults = await this.searchExactKeywords(query, keywords, phrases);
     for (const result of exactResults) {
       const existing = byFilePath.get(result.filePath);
-      if (!existing || result.score > existing.score) byFilePath.set(result.filePath, result);
+      if (!existing || result.score > existing.score) {
+        // Preserve vector evidence as well as the full-file lexical evidence.
+        result.searchEvidence = [existing?.searchEvidence, result.searchEvidence]
+          .filter(Boolean)
+          .join('\n');
+        byFilePath.set(result.filePath, result);
+      } else if (result.searchEvidence) {
+        existing.searchEvidence = [existing.searchEvidence, result.searchEvidence]
+          .filter(Boolean)
+          .join('\n');
+      }
     }
     const vectorResults = Array.from(byFilePath.values());
 
@@ -647,13 +668,21 @@ export class LanceDBService implements OnModuleInit {
     const isAudioIntent = keywords.some((keyword) =>
       ['audio', 'recording', 'recordings', 'podcast', 'podcasts', 'voice', 'voices', 'sound'].includes(keyword),
     );
+    const isDocumentIntent = /\b(?:doc|document|documents|pdf|invoice|report|word)\b/i.test(query);
+    // A comma-separated phrase list is a precise request. Requiring two
+    // concepts prevents a generic source file containing only “launch” from
+    // outranking a document that also contains the requested pay/ranking idea.
+    const requiredPhraseMatches = phrases.length >= 2 ? 2 : (phrases.length === 1 ? 1 : 0);
+    const strictKeywordQuery = keywords.length >= 2 &&
+      /\b(?:and|contains?|containing|has|have|words?|terms?)\b/i.test(query);
+    const requiredKeywordCoverage = strictKeywordQuery ? 0.999 : 0.75;
 
     // Score results with a bounded lexical boost. The old additive scoring
     // saturated at 1.0 whenever a common word such as "product" appeared,
     // which made unrelated source files look as relevant as the real PDFs.
     const scoredResults = vectorResults.map((result) => {
       const semanticScore = Math.max(0, Math.min(1, semanticScoreByPath.get(result.filePath) ?? result.score));
-      const searchableText = `${result.content} ${result.fileName} ${result.filePath}`.toLowerCase();
+      const searchableText = `${result.searchEvidence ?? ''} ${result.content} ${result.fileName} ${result.filePath}`.toLowerCase();
       // Count whole-word evidence for coverage. Substring matching is useful
       // for ordinary filename boosts, but it makes a two-letter vendor token
       // such as “RR” match unrelated words like “error” or “array”.
@@ -662,13 +691,26 @@ export class LanceDBService implements OnModuleInit {
         return new RegExp(`(^|[^a-z0-9])${escaped}(?=$|[^a-z0-9])`, 'i').test(searchableText);
       });
       const coverage = keywords.length === 0 ? 0 : matchedKeywords.length / keywords.length;
+      const phraseWeights = phrases.map((phrase) => Math.max(1, this.queryKeywords(phrase).length));
+      const phraseWeightTotal = phraseWeights.reduce((sum, weight) => sum + weight, 0);
+      const phraseCoverage = phraseWeightTotal === 0
+        ? 0
+        : phrases.reduce((sum, phrase, index) =>
+          sum + (this.matchesPhrase(phrase, searchableText) ? phraseWeights[index] : 0), 0) / phraseWeightTotal;
+      const phraseMatchCount = phrases.filter((phrase) => this.matchesPhrase(phrase, searchableText)).length;
       const meaningfulPhrase = keywords.join(' ');
       const phraseMatch = meaningfulPhrase.length > 4 && searchableText.includes(meaningfulPhrase);
-      let lexicalScore = phraseMatch ? 1 : coverage;
+      // "words like A, B, C" is an OR-style natural-language request. A
+      // document should be eligible when it contains at least one requested
+      // concept, and files containing more of the requested concepts rank
+      // above generic neighbours. Phrase coverage is computed over the whole
+      // file, not a single chunk.
+      let lexicalScore = Math.max(coverage, phraseCoverage);
+      if (phraseMatch) lexicalScore = 1;
       if (matchedKeywords.some((keyword) => result.fileName.toLowerCase().includes(keyword))) {
         lexicalScore = Math.min(1, lexicalScore + 0.18);
       }
-      let keywordScore = lexicalScore * 0.42;
+      let keywordScore = lexicalScore * 0.42 + phraseCoverage * 0.35;
       let hasDirectVisualMatch = false;
       const contentLower = result.content.toLowerCase();
       const fileNameLower = result.fileName.toLowerCase();
@@ -702,6 +744,8 @@ export class LanceDBService implements OnModuleInit {
         hasDirectVisualMatch,
         keywordCoverage: coverage,
         phraseMatch,
+        phraseCoverage,
+        phraseMatchCount,
       };
     });
 
@@ -713,15 +757,27 @@ export class LanceDBService implements OnModuleInit {
       if (keywords.length === 0) return true;
       if (isImageIntent && result.mediaType !== 'image') return false;
       if (isAudioIntent && result.mediaType !== 'audio') return false;
-      const strongLexicalMatch = result.keywordCoverage >= 0.75 || result.phraseMatch;
+      if (isDocumentIntent && result.mediaType !== 'text') return false;
+      const explicitPhraseMatch = phrases.length > 0 &&
+        (result.phraseMatchCount ?? 0) >= requiredPhraseMatches;
+      const strongLexicalMatch = result.keywordCoverage >= requiredKeywordCoverage || result.phraseMatch ||
+        explicitPhraseMatch;
       const strongSemanticMatch = result.score >= 0.72 &&
-        (result.keywordCoverage >= 0.5 || result.mediaType === 'image');
+        (result.keywordCoverage >= requiredKeywordCoverage || result.mediaType === 'image' ||
+          explicitPhraseMatch);
       return strongLexicalMatch || strongSemanticMatch;
     });
 
     const sortedResults = relevantResults.sort((a, b) => {
       if (a.hasDirectVisualMatch !== b.hasDirectVisualMatch) {
         return a.hasDirectVisualMatch ? -1 : 1;
+      }
+      // For an explicit phrase list, satisfy more of the requested concepts
+      // before considering broad embedding similarity. This prevents a
+      // random source file containing “launch” from outranking a document
+      // that contains the requested pay-to-rank concept.
+      if (phrases.length > 0 && (a.phraseCoverage ?? 0) !== (b.phraseCoverage ?? 0)) {
+        return (b.phraseCoverage ?? 0) - (a.phraseCoverage ?? 0);
       }
       return b.score - a.score;
     });
@@ -734,11 +790,11 @@ export class LanceDBService implements OnModuleInit {
   private queryKeywords(query: string): string[] {
     const stopWords = new Set([
       'a', 'an', 'and', 'anything', 'are', 'about', 'be', 'can', 'contains',
-      'contain', 'containing', 'document', 'documents', 'file', 'files', 'find', 'for',
-      'from', 'give', 'get', 'i', 'in', 'is', 'it', 'me', 'my', 'of', 'on',
-      'or', 'please', 'related', 'relation', 'search', 'show', 'something',
+      'contain', 'containing', 'document', 'documents', 'doc', 'file', 'files', 'find', 'for',
+      'from', 'give', 'get', 'has', 'have', 'having', 'i', 'in', 'is', 'it', 'me', 'my', 'of', 'on',
+      'or', 'please', 'related', 'relation', 'search', 'show', 'something', 'as', 'like', 'such',
       'that', 'the', 'these', 'this', 'those', 'to', 'type', 'types', 'want',
-      'what', 'where', 'which', 'with', 'you',
+      'term', 'terms', 'word', 'words', 'what', 'where', 'which', 'with', 'you',
     ]);
     return query
       .toLowerCase()
@@ -749,7 +805,52 @@ export class LanceDBService implements OnModuleInit {
       .filter((token) => token.length >= 2 && !stopWords.has(token));
   }
 
-  private async searchExactKeywords(query: string, keywords: string[]): Promise<SearchResult[]> {
+  /**
+   * Pull the concepts after phrasing such as "words like A, B, C". Commas
+   * and semicolons are meaningful separators; a multi-word item remains one
+   * phrase so "pay to get to top" is not reduced to unrelated title tokens.
+   */
+  private queryPhrases(query: string): string[] {
+    const match = query.match(/\b(?:words?|phrases?|terms?)\s+(?:like|such\s+as)\s+(.+)$/i);
+    if (!match) return [];
+    return match[1]
+      .split(/[,;]|\s+\bor\b\s+/i)
+      .map((part) => part.replace(/^[\s:]+|[\s.?!]+$/g, '').trim())
+      .filter((part) => part.length >= 2)
+      .slice(0, 12);
+  }
+
+  /** Match a phrase against all text belonging to a file. Exact adjacency is
+   * preferred, but meaningful terms are allowed to be separated because a
+   * user saying "pay to get to top" is commonly describing an idea such as
+   * pay-to-rank or pay-to-upgrade rather than quoting it verbatim.
+   */
+  private matchesPhrase(phrase: string, searchableText: string): boolean {
+    const normalizedPhrase = phrase.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+    if (!normalizedPhrase) return false;
+    if (searchableText.includes(normalizedPhrase)) return true;
+    const phraseKeywords = this.queryKeywords(normalizedPhrase);
+    if (phraseKeywords.length === 0) return searchableText.includes(normalizedPhrase);
+    const allTermsPresent = phraseKeywords.every((keyword) => {
+      const escaped = keyword.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      return new RegExp(`(^|[^a-z0-9])${escaped}(?=$|[^a-z0-9])`, 'i').test(searchableText);
+    });
+    if (allTermsPresent) return true;
+
+    // Common equivalent wording for ranking/auction prompts. This keeps the
+    // deterministic fallback useful when a local reasoning model is offline.
+    if (/\bpay\b/.test(normalizedPhrase) && /\b(top|get|reach|rank|upgrade|position|climb)\b/.test(normalizedPhrase)) {
+      return /\b(pay|paid|paying|payment)\b/.test(searchableText) &&
+        /\b(top|rank|ranking|upgrade|position|climb|bid|bidding|auction)\b/.test(searchableText);
+    }
+    return false;
+  }
+
+  private async searchExactKeywords(
+    query: string,
+    keywords: string[],
+    phrases: string[] = [],
+  ): Promise<SearchResult[]> {
     if (!this.textTable || keywords.length === 0) return [];
     try {
       const rows = (await this.textTable.query()
@@ -757,29 +858,67 @@ export class LanceDBService implements OnModuleInit {
         .limit(100000)
         .toArray()) as any[];
       const phrase = query.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
-      const byPath = new Map<string, SearchResult>();
+      type FileEvidence = {
+        bestRow: any;
+        bestRowScore: number;
+        contents: string[];
+        matchedKeywords: Set<string>;
+      };
+      const byPath = new Map<string, FileEvidence>();
       for (const row of rows) {
         if (!this.isSearchableUserFile(row.filePath)) continue;
         const content = String(row.content || '');
         const haystack = `${content} ${String(row.fileName || '')}`.toLowerCase();
-        const matched = keywords.filter((keyword) => haystack.includes(keyword));
+        const matched = keywords.filter((keyword) => {
+          const escaped = keyword.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+          return new RegExp(`(^|[^a-z0-9])${escaped}(?=$|[^a-z0-9])`, 'i').test(haystack);
+        });
         if (matched.length === 0) continue;
         const phraseMatch = phrase.length > 4 && haystack.includes(phrase);
         const score = Math.min(1, 0.52 + (matched.length / keywords.length) * 0.38 + (phraseMatch ? 0.1 : 0));
-        const candidate: SearchResult = {
+        const existing = byPath.get(row.filePath);
+        if (!existing) {
+          byPath.set(row.filePath, {
+            bestRow: row,
+            bestRowScore: score,
+            contents: [content, String(row.fileName || '')],
+            matchedKeywords: new Set(matched),
+          });
+        } else {
+          existing.contents.push(content);
+          existing.matchedKeywords = new Set([...existing.matchedKeywords, ...matched]);
+          if (score > existing.bestRowScore) {
+            existing.bestRow = row;
+            existing.bestRowScore = score;
+          }
+        }
+      }
+      return Array.from(byPath.entries()).map(([filePath, evidence]) => {
+        const row = evidence.bestRow;
+        const allText = evidence.contents.join('\n').toLowerCase();
+        const keywordCoverage = evidence.matchedKeywords.size / keywords.length;
+        const phraseWeights = phrases.map((item) => Math.max(1, this.queryKeywords(item).length));
+        const phraseWeightTotal = phraseWeights.reduce((sum, weight) => sum + weight, 0);
+        const phraseCoverage = phraseWeightTotal === 0
+          ? 0
+          : phrases.reduce((sum, item, index) =>
+            sum + (this.matchesPhrase(item, allText) ? phraseWeights[index] : 0), 0) / phraseWeightTotal;
+        const phraseMatchCount = phrases.filter((item) => this.matchesPhrase(item, allText)).length;
+        const score = Math.min(1, 0.42 + keywordCoverage * 0.38 + phraseCoverage * 0.35);
+        return {
           id: row.id,
-          content,
-          filePath: row.filePath,
+          content: String(row.content || ''),
+          filePath,
           fileName: row.fileName,
           mediaType: row.mediaType || 'text',
           thumbnailPath: row.thumbnailPath,
           metadata: this.parseMetadata(row.metadata),
           score,
-        };
-        const existing = byPath.get(candidate.filePath);
-        if (!existing || candidate.score > existing.score) byPath.set(candidate.filePath, candidate);
-      }
-      return Array.from(byPath.values()).sort((a, b) => b.score - a.score);
+          searchEvidence: allText,
+          phraseCoverage,
+          phraseMatchCount,
+        } as SearchResult;
+      }).sort((a, b) => b.score - a.score);
     } catch (e) {
       this.logger.warn(`Exact keyword search unavailable: ${e}`);
       return [];

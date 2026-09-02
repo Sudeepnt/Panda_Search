@@ -20,17 +20,21 @@ import * as XLSX from 'xlsx';
 const CHUNK_WORD_COUNT = 280;
 const CHUNK_OVERLAP_WORDS = 50;
 const MIN_CONTENT_FOR_CHUNKING = 800;
-// Keep very large source/log files searchable without creating thousands of
-// Lance rows (the Finder table still represents one file). The first and last
-// chunks preserve headers and recent/footer information; the middle is
-// represented by a searchable marker.
-const MAX_CHUNKS_PER_FILE = 24;
+// Keep the chunk size small enough for reliable semantic retrieval, but never
+// silently discard the middle of a document. Very large files use one
+// preserved middle chunk so exact lexical search still sees every word while
+// semantic indexing remains bounded.
+const MAX_CHUNKS_PER_FILE = 96;
 
 // Max file size for ingest (1GB) - applies to text, audio, and image files
 const MAX_FILE_SIZE_BYTES = 1024 * 1024 * 1024;
 const MAX_TEXT_BYTES_TO_INDEX = 8 * 1024 * 1024;
 const PDF_OCR_MIN_TEXT_CHARS = 24;
-const PDF_OCR_MAX_PAGES = 5;
+// Scanned PDFs often put the important sentence well past the first few pages
+// (for example a pricing rule on page 14 or a launch plan on page 38). OCR
+// every page up to a generous safety ceiling instead of returning a title-only
+// record that can never answer a body-content query.
+const PDF_OCR_MAX_PAGES = 200;
 
 // Concurrency settings for parallel processing
 const DEFAULT_CONCURRENCY = 10; // Process 10 files in parallel
@@ -95,9 +99,12 @@ export class IngestService {
     if (chunks.length <= MAX_CHUNKS_PER_FILE) return chunks;
     const headCount = Math.floor((MAX_CHUNKS_PER_FILE - 1) / 2);
     const tailCount = MAX_CHUNKS_PER_FILE - 1 - headCount;
+    const middle = chunks
+      .slice(headCount, chunks.length - tailCount)
+      .join(' ');
     return [
       ...chunks.slice(0, headCount),
-      '[middle content omitted from bounded index]',
+      `[middle content preserved for exact search] ${middle}`,
       ...chunks.slice(-tailCount),
     ];
   }
@@ -165,8 +172,8 @@ export class IngestService {
           const ext = path.extname(dto.filePath).toLowerCase();
 
           if (ext === '.pdf') {
-            // Extract normal PDF text, with a bounded OCR fallback for
-            // scanned/image-only invoices and receipts.
+            // Extract normal PDF text, with a full-document OCR fallback for
+            // scanned/image-only invoices, receipts, and reports.
             content = await this.extractPdfText(dto.filePath);
             this.logger.log(
               `Extracted ${content.length} chars from PDF: ${fileName}`,

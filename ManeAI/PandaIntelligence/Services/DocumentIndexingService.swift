@@ -166,7 +166,12 @@ class DocumentIndexingService: ObservableObject {
     ///   - urls: Files to index
     ///   - maxConcurrency: Maximum parallel operations (default: 10)
     /// - Returns: Array of IndexingResult for each file
-    func indexFilesIfNeededConcurrent(_ urls: [URL], maxConcurrency: Int = 10, forceReindex: Bool = false) async -> [IndexingResult] {
+    func indexFilesIfNeededConcurrent(
+        _ urls: [URL],
+        maxConcurrency: Int = 10,
+        forceReindex: Bool = false,
+        forceTextReindex: Bool = false
+    ) async -> [IndexingResult] {
         guard !urls.isEmpty else { return [] }
 
         isIndexing = true
@@ -193,10 +198,12 @@ class DocumentIndexingService: ObservableObject {
                         return (index, url, nil, .failed(error: IndexingError.hashComputationFailed))
                     }
 
+                    let shouldForceReindex = forceReindex || (forceTextReindex && mediaType == .text)
+
                     // Check if already indexed. An old image row can have a
                     // hash and embedding but no VLM title/description; that
                     // row is deliberately eligible for one visual upgrade.
-                    if !forceReindex, let existingFile = await self.findIndexedFile(path: filePath, hash: contentHash) {
+                    if !shouldForceReindex, let existingFile = await self.findIndexedFile(path: filePath, hash: contentHash) {
                         let visualComplete = mediaType == .image
                             ? await self.hasVisualRecord(existingFile)
                             : true
@@ -251,7 +258,10 @@ class DocumentIndexingService: ObservableObject {
         // dramatically faster than opening a write transaction per file.
         // Individual SwiftData rows still retain each file's response timing.
         if !textFiles.isEmpty {
-            indexedResults.append(contentsOf: await indexTextBatch(textFiles, forceReindex: forceReindex))
+            indexedResults.append(contentsOf: await indexTextBatch(
+                textFiles,
+                forceReindex: forceReindex || forceTextReindex
+            ))
         }
 
         // Process media files concurrently (audio/image need individual processing)
