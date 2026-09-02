@@ -9,10 +9,12 @@ struct ContentView: View {
     @EnvironmentObject var apiService: APIService
     @EnvironmentObject var indexingService: DocumentIndexingService
     @EnvironmentObject var fileMonitoringService: FileMonitoringService
+    @EnvironmentObject var sidecarManager: SidecarManager
 
     @State private var prompt = ""
     @State private var history: [String] = []
     @State private var results: [SearchResult] = []
+    @State private var searchError: String?
     @State private var isSearching = false
     @State private var didSearch = false
     @State private var isIndexingLibrary = false
@@ -201,7 +203,8 @@ struct ContentView: View {
     }
 
     private var resultSubtitle: String {
-        results.isEmpty ? "No matching files were found in your indexed folders." : "Your matching files are ready to review."
+        if let searchError, results.isEmpty { return searchError }
+        return results.isEmpty ? "No matching files were found in your indexed folders." : "Your matching files are ready to review."
     }
 
     private var topStatus: String {
@@ -236,7 +239,7 @@ struct ContentView: View {
                 Image(systemName: results.isEmpty ? "minus.circle" : "checkmark.circle.fill").foregroundStyle(results.isEmpty ? .white.opacity(0.45) : PandaPalette.mint)
             }.padding(22)
             if results.isEmpty {
-                Text("Index a folder first, then ask Panda Intelligence to find anything inside it.")
+                Text(searchError ?? "No indexed file matched that request. Try a broader description or scan the Local Mac.")
                     .foregroundStyle(.white.opacity(0.55)).padding(.horizontal, 22).padding(.bottom, 22)
             } else {
                 Divider().overlay(.white.opacity(0.08))
@@ -283,7 +286,7 @@ struct ContentView: View {
             .overlay(Circle().stroke(.white.opacity(0.12)))
     }
 
-    private func resetTask() { prompt = ""; results = []; didSearch = false; isShowingImageIndex = false }
+    private func resetTask() { prompt = ""; results = []; searchError = nil; didSearch = false; isShowingImageIndex = false }
 
     private func addLibraryFolder() {
         Task {
@@ -528,15 +531,37 @@ struct ContentView: View {
             // writes and vector queries. Use the same gate as the scanner so
             // a person’s search never overlaps an indexing write.
             await LocalVectorOperationGate.semaphore.wait()
-            let modelStatus = try? await apiService.getOllamaStatus()
-            brainStatus = modelStatus?.available == true
-                ? "Panda brain is understanding your files…"
-                : "Searching your local library…"
-            results = (try? await apiService.search(query: query, limit: 50).results) ?? []
+            // A distribution build owns its sidecar, while an Xcode build may
+            // talk to the developer backend. Re-check and start the local
+            // service before searching so a relaunch or a slow sidecar startup
+            // cannot be mistaken for an empty index.
+            await sidecarManager.checkHealth()
+            if !sidecarManager.isHealthy {
+                await sidecarManager.start()
+                await sidecarManager.checkHealth()
+            }
+
+            do {
+                let modelStatus = try? await apiService.getOllamaStatus()
+                brainStatus = modelStatus?.available == true
+                    ? "Panda brain is understanding your files…"
+                    : "Searching your local library…"
+                results = try await apiService.search(query: query, limit: 50).results
+                searchError = nil
+            } catch {
+                // Never turn a transport/decoding failure into the misleading
+                // “index a folder first” empty state. The user can retry while
+                // the sidecar restarts, and the actual local error is visible.
+                results = []
+                searchError = "Panda could not reach the local file index. \(error.localizedDescription)"
+                brainStatus = "Local file index unavailable"
+            }
             await LocalVectorOperationGate.semaphore.signal()
-            brainStatus = results.isEmpty
-                ? "Panda Intelligence is ready for your task"
-                : "Panda found \(results.count) relevant file\(results.count == 1 ? "" : "s")"
+            if searchError == nil {
+                brainStatus = results.isEmpty
+                    ? "Panda Intelligence is ready for your task"
+                    : "Panda found \(results.count) relevant file\(results.count == 1 ? "" : "s")"
+            }
         }
     }
 

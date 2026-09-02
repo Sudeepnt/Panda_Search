@@ -530,8 +530,20 @@ export class LanceDBService implements OnModuleInit {
       fileName: row.fileName,
       mediaType: row.mediaType || 'text',
       metadata: this.parseMetadata(row.metadata),
-      score: row._distance ? 1 - row._distance : 0,
+      // Lance's default vector metric is L2 distance. Treating that value as
+      // `1 - distance` made a useful visual neighbour look negative and caused
+      // the relevance gate to discard it. Convert the normalized embedding
+      // distance back to cosine-like similarity.
+      score: this.vectorSimilarity(row._distance),
     }));
+  }
+
+  /** Convert Lance's normalized L2 distance to a stable [0, 1] score. */
+  private vectorSimilarity(distance: unknown): number {
+    const value = Number(distance);
+    if (!Number.isFinite(value)) return 0;
+    const boundedDistance = Math.max(0, Math.min(2, value));
+    return Math.max(0, Math.min(1, 1 - (boundedDistance * boundedDistance) / 2));
   }
 
   private isSearchableUserFile(filePath: string): boolean {
@@ -662,13 +674,21 @@ export class LanceDBService implements OnModuleInit {
     // its embedding is close. Keep the constraint narrow so an unconstrained
     // concept query (for example, “files about a green panda”) can still
     // return any useful file type.
-    const isImageIntent = keywords.some((keyword) =>
-      ['image', 'images', 'photo', 'photos', 'picture', 'pictures', 'screenshot', 'screenshots'].includes(keyword),
-    );
-    const isAudioIntent = keywords.some((keyword) =>
-      ['audio', 'recording', 'recordings', 'podcast', 'podcasts', 'voice', 'voices', 'sound'].includes(keyword),
-    );
-    const isDocumentIntent = /\b(?:doc|document|documents|pdf|invoice|report|word)\b/i.test(query);
+    // Media words are intent, not content. Detect them from the original
+    // query because queryKeywords deliberately removes generic media terms so
+    // captions such as "[image, picture, file, png format]" do not make every
+    // image look like an exact match.
+    const explicitImageIntent = /\b(?:image|images|photo|photos|picture|pictures|screenshot|screenshots)\b/i.test(query);
+    const isAudioIntent = /\b(?:audio|recording|recordings|podcast|podcasts|voice|voices|sound)\b/i.test(query);
+    const isDocumentIntent = !explicitImageIntent && !isAudioIntent &&
+      /\b(?:doc|document|documents|pdf|invoice|invoices|receipt|receipts|report|reports|contract|contracts|word)\b/i.test(query);
+    // People naturally omit the word "image" ("find the guy in a suit",
+    // "show the panda with green eyes"). VLM captions are the source of truth
+    // for these visual nouns, so route those queries through the image-aware
+    // relevance path as long as the user did not explicitly request a text
+    // document.
+    const visualConceptQuery = /\b(?:guy|man|woman|person|people|face|faces|portrait|wearing|suit|jacket|shirt|animal|dog|cat|panda|building|landscape|mountain|car|vehicle|flower|food|logo|icon|eye|eyes)\b/i.test(query);
+    const isImageIntent = explicitImageIntent || (!isDocumentIntent && visualConceptQuery);
     // A comma-separated phrase list is a precise request. Requiring two
     // concepts prevents a generic source file containing only “launch” from
     // outranking a document that also contains the requested pay/ranking idea.
@@ -687,8 +707,12 @@ export class LanceDBService implements OnModuleInit {
       // for ordinary filename boosts, but it makes a two-letter vendor token
       // such as “RR” match unrelated words like “error” or “array”.
       const matchedKeywords = keywords.filter((keyword) => {
-        const escaped = keyword.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-        return new RegExp(`(^|[^a-z0-9])${escaped}(?=$|[^a-z0-9])`, 'i').test(searchableText);
+        const candidates = (isImageIntent ? this.visualAliases(keyword) : [keyword])
+          .flatMap((candidate) => this.keywordForms(candidate));
+        return candidates.some((candidate) => {
+          const escaped = candidate.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+          return new RegExp(`(^|[^a-z0-9])${escaped}(?=$|[^a-z0-9])`, 'i').test(searchableText);
+        });
       });
       const coverage = keywords.length === 0 ? 0 : matchedKeywords.length / keywords.length;
       const phraseWeights = phrases.map((phrase) => Math.max(1, this.queryKeywords(phrase).length));
@@ -727,13 +751,17 @@ export class LanceDBService implements OnModuleInit {
       // merely appearing in a screenshot filename or its OCR transcript.
       if (isImageIntent && result.mediaType === 'image') {
         const visualLabels = contentLower.match(/\[local visual labels\]([\s\S]*)/)?.[1] ?? '';
-        if (keywords.some((keyword) => visualLabels.includes(keyword))) {
+        if (keywords.some((keyword) => visualLabels.includes(keyword)) ||
+            matchedKeywords.some((keyword) => contentLower.includes(keyword))) {
           keywordScore += 0.35;
           hasDirectVisualMatch = true;
         }
         const isGenericScreenshot = /screenshot/.test(fileNameLower) &&
           /\[local visual labels\][\s\S]*(document|screenshot)/.test(contentLower);
-        if (isGenericScreenshot && !keywords.includes('screenshot')) {
+        // A screenshot is only generic when it has no evidence for any of
+        // the requested visual concepts. Do not suppress a profile screenshot
+        // that explicitly mentions a suit, person, product, or other match.
+        if (isGenericScreenshot && !keywords.includes('screenshot') && matchedKeywords.length === 0) {
           keywordScore -= 0.55;
         }
       }
@@ -749,23 +777,50 @@ export class LanceDBService implements OnModuleInit {
       };
     });
 
+    const hasVisualEvidence = isImageIntent && scoredResults.some((result) =>
+      result.mediaType === 'image' && ((result.keywordCoverage ?? 0) >= 0.5 || result.hasDirectVisualMatch),
+    );
+    // If a document query has real document formats among its candidates,
+    // prefer those over source/config files that happen to repeat the same
+    // words in comments. Keep the code fallback when no document is indexed.
+    const hasDocumentEvidence = isDocumentIntent && scoredResults.some((result) =>
+      result.mediaType === 'text' && this.isDocumentLikePath(result.filePath) &&
+      ((result.keywordCoverage ?? 0) >= 0.5 || (result.phraseCoverage ?? 0) > 0),
+    );
+
     // A natural-language query often contains only one or two meaningful
     // terms after stop-word removal. Keep exact/near-exact matches and strong
     // semantic matches, but drop weak vector neighbours before the optional
     // local language-model reranker sees them.
     const relevantResults = scoredResults.filter((result) => {
-      if (keywords.length === 0) return true;
+      // Apply an explicit media request even when the query has no subject
+      // words ("find images"), otherwise text embeddings can leak into the
+      // result grid.
       if (isImageIntent && result.mediaType !== 'image') return false;
       if (isAudioIntent && result.mediaType !== 'audio') return false;
       if (isDocumentIntent && result.mediaType !== 'text') return false;
+      if (hasDocumentEvidence && !this.isDocumentLikePath(result.filePath)) return false;
+      if (keywords.length === 0) return true;
       const explicitPhraseMatch = phrases.length > 0 &&
         (result.phraseMatchCount ?? 0) >= requiredPhraseMatches;
       const strongLexicalMatch = result.keywordCoverage >= requiredKeywordCoverage || result.phraseMatch ||
         explicitPhraseMatch;
-      const strongSemanticMatch = result.score >= 0.72 &&
-        (result.keywordCoverage >= requiredKeywordCoverage || result.mediaType === 'image' ||
+      // Visual captions use natural language, so a query may contain a
+      // synonym that the caption does not repeat verbatim ("guy" vs
+      // "person", for example). Keep a useful semantic image neighbour even
+      // when the lexical coverage is partial; text searches retain the stricter
+      // gate to avoid unrelated files.
+      const semanticThreshold = isImageIntent ? 0.5 : 0.72;
+      // With multiple visual concepts, require evidence for most of them.
+      // This keeps "guy in a suit" from filling the grid with every portrait
+      // that merely mentions people, while a one-concept query can still use
+      // the normal semantic threshold.
+      const partialVisualMatch = isImageIntent && result.keywordCoverage >= 0.75;
+      const strongSemanticMatch = result.score >= semanticThreshold &&
+        (result.keywordCoverage >= requiredKeywordCoverage ||
+          (result.mediaType === 'image' && (!hasVisualEvidence || result.hasDirectVisualMatch)) ||
           explicitPhraseMatch);
-      return strongLexicalMatch || strongSemanticMatch;
+      return strongLexicalMatch || partialVisualMatch || strongSemanticMatch;
     });
 
     const sortedResults = relevantResults.sort((a, b) => {
@@ -795,6 +850,12 @@ export class LanceDBService implements OnModuleInit {
       'or', 'please', 'related', 'relation', 'search', 'show', 'something', 'as', 'like', 'such',
       'that', 'the', 'these', 'this', 'those', 'to', 'type', 'types', 'want',
       'term', 'terms', 'word', 'words', 'what', 'where', 'which', 'with', 'you',
+      // Media words describe the requested result type. The media-intent
+      // filters handle them separately so a caption prefix such as
+      // "[image, picture, file]" does not make every image an exact match.
+      'image', 'images', 'photo', 'photos', 'picture', 'pictures',
+      'screenshot', 'screenshots', 'audio', 'recording', 'recordings',
+      'podcast', 'podcasts', 'voice', 'voices', 'sound',
     ]);
     return query
       .toLowerCase()
@@ -803,6 +864,50 @@ export class LanceDBService implements OnModuleInit {
       // Keep two-letter acronyms such as "RR"; they are often the most
       // important part of an invoice/vendor query.
       .filter((token) => token.length >= 2 && !stopWords.has(token));
+  }
+
+  /**
+   * Small, transparent synonym groups for visual language. VLM captions tend
+   * to say "adult" or "people" where a person asks for a "guy", and use
+   * "clothing" where the prompt says "suit". This supplements embeddings;
+   * it never changes text/document matching.
+   */
+  private visualAliases(keyword: string): string[] {
+    const groups: Record<string, string[]> = {
+      guy: ['guy', 'man', 'person', 'people', 'adult', 'boy', 'male'],
+      man: ['man', 'guy', 'person', 'people', 'adult', 'boy', 'male'],
+      woman: ['woman', 'girl', 'person', 'people', 'adult', 'female'],
+      person: ['person', 'people', 'adult', 'man', 'woman', 'guy', 'boy', 'girl'],
+      people: ['people', 'person', 'adults', 'man', 'woman', 'guy', 'boy', 'girl'],
+      suit: ['suit', 'clothing', 'formal', 'jacket', 'blazer', 'coat'],
+      wearing: ['wearing', 'wear', 'clothing', 'outfit', 'dressed'],
+      face: ['face', 'portrait', 'head'],
+      faces: ['faces', 'face', 'people', 'portraits'],
+      eye: ['eye', 'eyes'],
+      eyes: ['eyes', 'eye'],
+    };
+    return groups[keyword] ?? [keyword];
+  }
+
+  /** Match common plural prompts to the singular form stored in a filename or
+   * extracted body ("invoices" -> "invoice", "categories" -> "category"). */
+  private keywordForms(keyword: string): string[] {
+    const forms = new Set([keyword]);
+    if (keyword.endsWith('ies') && keyword.length > 4) {
+      forms.add(`${keyword.slice(0, -3)}y`);
+    } else if (keyword.endsWith('s') && keyword.length > 3 && !keyword.endsWith('ss')) {
+      forms.add(keyword.slice(0, -1));
+    }
+    return Array.from(forms);
+  }
+
+  private isDocumentLikePath(filePath: string): boolean {
+    const extension = path.extname(filePath).toLowerCase();
+    return new Set([
+      '.pdf', '.doc', '.docx', '.odt', '.rtf', '.txt', '.md', '.markdown',
+      '.csv', '.tsv', '.xls', '.xlsx', '.numbers', '.pages', '.key', '.ppt',
+      '.pptx', '.eml', '.msg', '.ics',
+    ]).has(extension);
   }
 
   /**
@@ -870,8 +975,10 @@ export class LanceDBService implements OnModuleInit {
         const content = String(row.content || '');
         const haystack = `${content} ${String(row.fileName || '')}`.toLowerCase();
         const matched = keywords.filter((keyword) => {
-          const escaped = keyword.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-          return new RegExp(`(^|[^a-z0-9])${escaped}(?=$|[^a-z0-9])`, 'i').test(haystack);
+          return this.keywordForms(keyword).some((form) => {
+            const escaped = form.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            return new RegExp(`(^|[^a-z0-9])${escaped}(?=$|[^a-z0-9])`, 'i').test(haystack);
+          });
         });
         if (matched.length === 0) continue;
         const phraseMatch = phrase.length > 4 && haystack.includes(phrase);
