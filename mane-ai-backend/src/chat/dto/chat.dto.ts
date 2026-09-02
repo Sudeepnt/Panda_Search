@@ -44,5 +44,6 @@ export class SearchResponseDto {
     mediaType: MediaType;
     thumbnailPath?: string;
     score: number;
+    matchReason?: string;
   }>;
 }

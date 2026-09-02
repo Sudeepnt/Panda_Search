@@ -107,6 +107,7 @@ struct SearchResult: Codable, Identifiable {
     let mediaType: MediaType?
     let thumbnailPath: String?
     let score: Double
+    let matchReason: String?
 }
 
 struct SearchResponse: Codable {

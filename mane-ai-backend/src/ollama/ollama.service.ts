@@ -299,6 +299,7 @@ export class OllamaService implements OnModuleInit {
     fileName: string;
     mediaType: string;
     score: number;
+    matchReason?: string;
   }>(query: string, candidates: T[], maxResults: number): Promise<T[] | null> {
     if (candidates.length === 0) return [];
 
@@ -368,6 +369,12 @@ Include one object for each candidate. score must be 0 to 1. Use relevant=false 
             // Preserve a strong deterministic retrieval score when it is
             // higher; the model controls ordering and relevance filtering.
             score: Math.max(candidate.score, Math.min(1, Number(decision.score))),
+            // When the local reasoning model provides concise evidence, show
+            // it in the UI. Deterministic retrieval already supplied a
+            // grounded fallback reason if the model omits one.
+            matchReason: typeof decision.reason === 'string' && decision.reason.trim().length > 0
+              ? decision.reason.trim().replace(/\s+/g, ' ').slice(0, 220)
+              : candidate.matchReason,
           };
         });
 

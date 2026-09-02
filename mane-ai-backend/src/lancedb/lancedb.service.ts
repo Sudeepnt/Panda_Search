@@ -54,6 +54,8 @@ export interface SearchResult {
   thumbnailPath?: string;
   metadata: Record<string, unknown>;
   score: number;
+  /** A short, evidence-based sentence displayed beside the search result. */
+  matchReason?: string;
   /**
    * Search-only evidence assembled from every chunk of a file. Keeping this
    * separate from `content` lets ranking see the whole document while the UI
@@ -523,7 +525,7 @@ export class LanceDBService implements OnModuleInit {
       .limit(effectiveLimit)
       .toArray();
 
-    return results.filter((row: any) => this.isSearchableUserFile(row.filePath)).map((row: any) => ({
+    return results.filter((row: any) => this.hasIndexedUnderstanding(row)).map((row: any) => ({
       id: row.id,
       content: row.content,
       filePath: row.filePath,
@@ -556,6 +558,51 @@ export class LanceDBService implements OnModuleInit {
       !filePath.startsWith(homePrefix) ||
       !fs.existsSync(filePath)) return false;
     return !filePath.split(path.sep).some((component) => this.excludedPathComponents.has(component));
+  }
+
+  /**
+   * Search must only surface files Panda has genuinely processed. In
+   * particular, never turn an image-captioning outage or a metadata-only
+   * binary record into a misleading search hit. Those rows stay in the local
+   * index for a later retry, but remain invisible until their contents are
+   * understood.
+   */
+  private hasIndexedUnderstanding(row: {
+    filePath?: unknown;
+    content?: unknown;
+    mediaType?: unknown;
+  }): boolean {
+    const filePath = typeof row.filePath === 'string' ? row.filePath : '';
+    if (!this.isSearchableUserFile(filePath)) return false;
+
+    const content = String(row.content ?? '').trim();
+    // Strip Panda's retrieval prefix before deciding whether there is actual
+    // content. A filename plus a format prefix is not file understanding.
+    const understoodContent = content.replace(/^\[[^\]]*\]\s*/, '').trim();
+    if (understoodContent.length < 24) return false;
+    if (/binary\/container content is indexed by filename, path, and format/i.test(understoodContent)) {
+      return false;
+    }
+
+    const mediaType = String(row.mediaType ?? 'text');
+    if (mediaType === 'image') {
+      // The image captioner writes a factual TITLE + DESCRIPTION. Its
+      // temporary filename fallback starts with “Image file:” and must not be
+      // allowed to masquerade as visual understanding.
+      return /\btitle:\s*\S/i.test(understoodContent) &&
+        understoodContent.length >= 80 &&
+        !/\bimage file:/i.test(understoodContent);
+    }
+    if (mediaType === 'audio') {
+      // A real transcript contains more than the file's wrapper metadata.
+      return understoodContent.length >= 40 &&
+        !/^(audio|recording) file:/i.test(understoodContent);
+    }
+
+    // Extracted documents, source files, and rich media descriptions all
+    // reach this path. They are searchable only when their body survived
+    // extraction rather than falling back to filename/path metadata.
+    return true;
   }
 
   /**
@@ -608,7 +655,7 @@ export class LanceDBService implements OnModuleInit {
 
       const filteredResults: SearchResult[] = [];
       for (const row of allRows) {
-        if (expandedIds.has(row.id)) {
+        if (expandedIds.has(row.id) && this.hasIndexedUnderstanding(row)) {
           filteredResults.push({
             id: row.id,
             content: row.content,
@@ -703,6 +750,16 @@ export class LanceDBService implements OnModuleInit {
     const scoredResults = vectorResults.map((result) => {
       const semanticScore = Math.max(0, Math.min(1, semanticScoreByPath.get(result.filePath) ?? result.score));
       const searchableText = `${result.searchEvidence ?? ''} ${result.content} ${result.fileName} ${result.filePath}`.toLowerCase();
+      // For object/person requests, use the detailed Qwen caption as the
+      // factual source of truth. Older local labels are intentionally coarse
+      // (for example, “adult” or “suit” can leak from a tiny background
+      // picture) and should not turn an unrelated screen or newspaper into a
+      // match for “the guy in a suit”. OCR remains searchable for ordinary
+      // text-in-image queries such as “a screenshot containing Supabase”.
+      const visualCaptionText = this.visualDescriptionText(result.content).toLowerCase();
+      const matchingText = isImageIntent && visualConceptQuery && result.mediaType === 'image'
+        ? `${visualCaptionText} ${result.fileName.toLowerCase()}`
+        : searchableText;
       // Count whole-word evidence for coverage. Substring matching is useful
       // for ordinary filename boosts, but it makes a two-letter vendor token
       // such as “RR” match unrelated words like “error” or “array”.
@@ -711,7 +768,7 @@ export class LanceDBService implements OnModuleInit {
           .flatMap((candidate) => this.keywordForms(candidate));
         return candidates.some((candidate) => {
           const escaped = candidate.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-          return new RegExp(`(^|[^a-z0-9])${escaped}(?=$|[^a-z0-9])`, 'i').test(searchableText);
+          return new RegExp(`(^|[^a-z0-9])${escaped}(?=$|[^a-z0-9])`, 'i').test(matchingText);
         });
       });
       const coverage = keywords.length === 0 ? 0 : matchedKeywords.length / keywords.length;
@@ -721,7 +778,8 @@ export class LanceDBService implements OnModuleInit {
         ? 0
         : phrases.reduce((sum, phrase, index) =>
           sum + (this.matchesPhrase(phrase, searchableText) ? phraseWeights[index] : 0), 0) / phraseWeightTotal;
-      const phraseMatchCount = phrases.filter((phrase) => this.matchesPhrase(phrase, searchableText)).length;
+      const matchedPhrases = phrases.filter((phrase) => this.matchesPhrase(phrase, searchableText));
+      const phraseMatchCount = matchedPhrases.length;
       const meaningfulPhrase = keywords.join(' ');
       const phraseMatch = meaningfulPhrase.length > 4 && searchableText.includes(meaningfulPhrase);
       // "words like A, B, C" is an OR-style natural-language request. A
@@ -751,8 +809,9 @@ export class LanceDBService implements OnModuleInit {
       // merely appearing in a screenshot filename or its OCR transcript.
       if (isImageIntent && result.mediaType === 'image') {
         const visualLabels = contentLower.match(/\[local visual labels\]([\s\S]*)/)?.[1] ?? '';
-        if (keywords.some((keyword) => visualLabels.includes(keyword)) ||
-            matchedKeywords.some((keyword) => contentLower.includes(keyword))) {
+        const directVisualText = visualConceptQuery ? visualCaptionText : contentLower;
+        if ((!visualConceptQuery && keywords.some((keyword) => visualLabels.includes(keyword))) ||
+            matchedKeywords.some((keyword) => directVisualText.includes(keyword))) {
           keywordScore += 0.35;
           hasDirectVisualMatch = true;
         }
@@ -771,6 +830,8 @@ export class LanceDBService implements OnModuleInit {
         score: Math.max(0, Math.min(1, semanticScore * 0.58 + keywordScore)),
         hasDirectVisualMatch,
         keywordCoverage: coverage,
+        matchedKeywords,
+        matchedPhrases,
         phraseMatch,
         phraseCoverage,
         phraseMatchCount,
@@ -816,9 +877,11 @@ export class LanceDBService implements OnModuleInit {
       // that merely mentions people, while a one-concept query can still use
       // the normal semantic threshold.
       const partialVisualMatch = isImageIntent && result.keywordCoverage >= 0.75;
+      const directVisualMatchSatisfiesQuery = result.hasDirectVisualMatch &&
+        (keywords.length <= 1 || result.keywordCoverage >= 0.75);
       const strongSemanticMatch = result.score >= semanticThreshold &&
         (result.keywordCoverage >= requiredKeywordCoverage ||
-          (result.mediaType === 'image' && (!hasVisualEvidence || result.hasDirectVisualMatch)) ||
+          (result.mediaType === 'image' && (!hasVisualEvidence || directVisualMatchSatisfiesQuery)) ||
           explicitPhraseMatch);
       return strongLexicalMatch || partialVisualMatch || strongSemanticMatch;
     });
@@ -837,8 +900,13 @@ export class LanceDBService implements OnModuleInit {
       return b.score - a.score;
     });
 
+    const withReasons = sortedResults.map((result) => ({
+      ...result,
+      matchReason: this.buildMatchReason(result, query),
+    }));
+
     // Return all results if limit is 0, otherwise slice to limit
-    return returnAll ? sortedResults : sortedResults.slice(0, limit);
+    return returnAll ? withReasons : withReasons.slice(0, limit);
   }
 
   /** Return normalized query tokens once, keeping punctuation out of exact matching. */
@@ -874,10 +942,10 @@ export class LanceDBService implements OnModuleInit {
    */
   private visualAliases(keyword: string): string[] {
     const groups: Record<string, string[]> = {
-      guy: ['guy', 'man', 'person', 'people', 'adult', 'boy', 'male'],
-      man: ['man', 'guy', 'person', 'people', 'adult', 'boy', 'male'],
-      woman: ['woman', 'girl', 'person', 'people', 'adult', 'female'],
-      person: ['person', 'people', 'adult', 'man', 'woman', 'guy', 'boy', 'girl'],
+      guy: ['guy', 'man', 'person', 'people', 'adult', 'boy', 'male', 'portrait', 'profile'],
+      man: ['man', 'guy', 'person', 'people', 'adult', 'boy', 'male', 'portrait', 'profile'],
+      woman: ['woman', 'girl', 'person', 'people', 'adult', 'female', 'portrait', 'profile'],
+      person: ['person', 'people', 'adult', 'man', 'woman', 'guy', 'boy', 'girl', 'portrait', 'profile'],
       people: ['people', 'person', 'adults', 'man', 'woman', 'guy', 'boy', 'girl'],
       suit: ['suit', 'clothing', 'formal', 'jacket', 'blazer', 'coat'],
       wearing: ['wearing', 'wear', 'clothing', 'outfit', 'dressed'],
@@ -887,6 +955,17 @@ export class LanceDBService implements OnModuleInit {
       eyes: ['eyes', 'eye'],
     };
     return groups[keyword] ?? [keyword];
+  }
+
+  /**
+   * The VLM caption comes first; optional OCR and coarse local labels follow
+   * in explicitly marked sections. Object searches use only the caption so a
+   * weak label cannot override the model's detailed scene description.
+   */
+  private visualDescriptionText(content: string): string {
+    return String(content ?? '')
+      .split(/\n\[(?:recognized text in image|local visual labels)\]/i)[0]
+      .trim();
   }
 
   /** Match common plural prompts to the singular form stored in a filename or
@@ -908,6 +987,41 @@ export class LanceDBService implements OnModuleInit {
       '.csv', '.tsv', '.xls', '.xlsx', '.numbers', '.pages', '.key', '.ppt',
       '.pptx', '.eml', '.msg', '.ics',
     ]).has(extension);
+  }
+
+  /** Build the short, user-facing evidence line shown on every result card. */
+  private buildMatchReason(
+    result: SearchResult & {
+      matchedKeywords?: string[];
+      matchedPhrases?: string[];
+      hasDirectVisualMatch?: boolean;
+    },
+    query: string,
+  ): string {
+    const source = result.mediaType === 'image'
+      ? "Panda's visual description"
+      : result.mediaType === 'audio'
+        ? "Panda's transcript"
+        : result.mediaType === 'video'
+          ? "Panda's video description"
+          : 'Panda\'s indexed text';
+    const quote = (value: string) => `“${value.replace(/\s+/g, ' ').trim()}”`;
+    const phrases = (result.matchedPhrases ?? []).slice(0, 2);
+    if (phrases.length > 0) {
+      return `${source} contains ${phrases.map(quote).join(' and ')}.`;
+    }
+
+    const terms = (result.matchedKeywords ?? []).slice(0, 3);
+    if (terms.length > 0) {
+      return `${source} matches ${terms.map(quote).join(', ')}.`;
+    }
+
+    if (result.hasDirectVisualMatch) {
+      return `${source} has direct visual evidence for this request.`;
+    }
+
+    const compactQuery = query.replace(/\s+/g, ' ').trim().slice(0, 96);
+    return `${source} is semantically related to ${quote(compactQuery)}.`;
   }
 
   /**
@@ -971,7 +1085,7 @@ export class LanceDBService implements OnModuleInit {
       };
       const byPath = new Map<string, FileEvidence>();
       for (const row of rows) {
-        if (!this.isSearchableUserFile(row.filePath)) continue;
+        if (!this.hasIndexedUnderstanding(row)) continue;
         const content = String(row.content || '');
         const haystack = `${content} ${String(row.fileName || '')}`.toLowerCase();
         const matched = keywords.filter((keyword) => {

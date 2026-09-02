@@ -76,6 +76,7 @@ export class ChatService {
         mediaType: (r.mediaType as any) || 'text',
         thumbnailPath: r.thumbnailPath,
         score: r.score,
+        matchReason: r.matchReason,
       })),
     };
   }

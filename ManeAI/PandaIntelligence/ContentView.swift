@@ -22,6 +22,7 @@ struct ContentView: View {
     @State private var brainStatus = "Panda Intelligence is ready for your task"
     @State private var isShowingImageIndex = false
     @State private var pendingFileAction: PendingFileAction?
+    @FocusState private var isPromptFocused: Bool
     // This is intentionally completion-based: an app restart or interrupted
     // scan must resume on the next prompt instead of permanently looking done.
     @AppStorage("PandaIntelligence.HasCompletedLibraryIndex") private var hasCompletedLibraryIndex = false
@@ -132,13 +133,24 @@ struct ContentView: View {
             ScrollView {
                 LazyVStack(spacing: 8) {
                     ForEach(history.indices.reversed(), id: \.self) { index in
-                        HStack(spacing: 11) {
-                            Image(systemName: "clock").foregroundStyle(PandaPalette.mint.opacity(0.85))
-                            Text(history[index]).lineLimit(2).font(.system(size: 13, weight: .medium))
-                            Spacer(minLength: 0)
-                            Circle().fill(PandaPalette.mint).frame(width: 7, height: 7)
+                        Button {
+                            // A history entry is a reusable prompt, not just
+                            // a record. Load it into the composer so the user
+                            // can edit it or submit it again without retyping.
+                            prompt = history[index]
+                            isPromptFocused = true
+                            brainStatus = "Previous prompt loaded — edit it or press Return"
+                        } label: {
+                            HStack(spacing: 11) {
+                                Image(systemName: "clock").foregroundStyle(PandaPalette.mint.opacity(0.85))
+                                Text(history[index]).lineLimit(2).font(.system(size: 13, weight: .medium))
+                                Spacer(minLength: 0)
+                                Circle().fill(PandaPalette.mint).frame(width: 7, height: 7)
+                            }
+                            .padding(13)
+                            .contentShape(Rectangle())
                         }
-                        .padding(13)
+                        .buttonStyle(.plain)
                         .background(PandaPalette.panel.opacity(0.7), in: RoundedRectangle(cornerRadius: 14))
                     }
                 }.padding(.top, 16)
@@ -268,7 +280,10 @@ struct ContentView: View {
         HStack(spacing: 14) {
             pandaAvatar(42)
             TextField("Ask Panda Intelligence to find, organize, move, or rename anything…", text: $prompt)
-                .textFieldStyle(.plain).font(.system(size: 16)).onSubmit(submitPrompt)
+                .textFieldStyle(.plain)
+                .font(.system(size: 16))
+                .focused($isPromptFocused)
+                .onSubmit(submitPrompt)
             Button(action: submitPrompt) {
                 Image(systemName: isSearching ? "ellipsis" : "arrow.up").font(.system(size: 18, weight: .bold))
                     .frame(width: 48, height: 48).background(PandaPalette.mint, in: Circle()).foregroundStyle(PandaPalette.canvas)
@@ -1066,7 +1081,8 @@ private enum FinderFileActions {
                 filePath: destination.path,
                 mediaType: result.mediaType,
                 thumbnailPath: result.thumbnailPath,
-                score: result.score
+                score: result.score,
+                matchReason: result.matchReason
             )
             return FinderActionOutcome(message: "Renamed to \(destination.lastPathComponent)", oldPath: result.filePath, updatedResult: updated)
 
@@ -1088,7 +1104,8 @@ private enum FinderFileActions {
                 filePath: destination.path,
                 mediaType: result.mediaType,
                 thumbnailPath: result.thumbnailPath,
-                score: result.score
+                score: result.score,
+                matchReason: result.matchReason
             )
             return FinderActionOutcome(message: "Moved \(result.fileName) to \(folder.lastPathComponent)", oldPath: result.filePath, updatedResult: updated)
 
@@ -1251,6 +1268,18 @@ private struct TaskResultRow: View {
                         .textSelection(.enabled)
                 }
                 Spacer(minLength: 0)
+            }
+
+            if let matchReason = result.matchReason,
+               !matchReason.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                Label(matchReason, systemImage: "sparkle.magnifyingglass")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(PandaPalette.mint.opacity(0.9))
+                    .lineLimit(3)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 8)
+                    .background(PandaPalette.mint.opacity(0.08), in: RoundedRectangle(cornerRadius: 9))
             }
 
             Text(summary)
