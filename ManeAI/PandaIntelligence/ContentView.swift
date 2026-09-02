@@ -12,7 +12,11 @@ struct ContentView: View {
     @EnvironmentObject var sidecarManager: SidecarManager
 
     @State private var prompt = ""
-    @State private var history: [String] = []
+    // History keeps lightweight result snapshots — never image bytes. Image
+    // cards re-open their local file path when a conversation is restored.
+    @State private var history: [SearchHistoryEntry] = []
+    @State private var didLoadSavedHistory = false
+    @AppStorage("PandaIntelligence.SearchHistorySnapshots") private var savedHistoryData = Data()
     @State private var results: [SearchResult] = []
     @State private var searchError: String?
     @State private var isSearching = false
@@ -56,6 +60,7 @@ struct ContentView: View {
             )
         }
         .task {
+            loadSavedHistoryIfNeeded()
             // Reconcile the derived table on every launch. This is cheap for
             // the local metadata store and removes deleted, hidden, excluded,
             // or older duplicate rows without touching Finder files.
@@ -132,25 +137,44 @@ struct ContentView: View {
 
             ScrollView {
                 LazyVStack(spacing: 8) {
-                    ForEach(history.indices.reversed(), id: \.self) { index in
-                        Button {
-                            // A history entry is a reusable prompt, not just
-                            // a record. Load it into the composer so the user
-                            // can edit it or submit it again without retyping.
-                            prompt = history[index]
-                            isPromptFocused = true
-                            brainStatus = "Previous prompt loaded — edit it or press Return"
-                        } label: {
-                            HStack(spacing: 11) {
-                                Image(systemName: "clock").foregroundStyle(PandaPalette.mint.opacity(0.85))
-                                Text(history[index]).lineLimit(2).font(.system(size: 13, weight: .medium))
-                                Spacer(minLength: 0)
-                                Circle().fill(PandaPalette.mint).frame(width: 7, height: 7)
+                    ForEach(Array(history.reversed())) { entry in
+                        HStack(spacing: 3) {
+                            Button {
+                                restoreHistory(entry)
+                            } label: {
+                                HStack(spacing: 11) {
+                                    Image(systemName: "clock").foregroundStyle(PandaPalette.mint.opacity(0.85))
+                                    Text(entry.query).lineLimit(2).font(.system(size: 13, weight: .medium))
+                                    Spacer(minLength: 0)
+                                    Text("\(entry.results.count)")
+                                        .font(.system(size: 11, weight: .bold, design: .rounded))
+                                        .foregroundStyle(PandaPalette.mint)
+                                }
+                                .padding(.leading, 13)
+                                .padding(.vertical, 13)
+                                .contentShape(Rectangle())
                             }
-                            .padding(13)
-                            .contentShape(Rectangle())
+                            .buttonStyle(.plain)
+
+                            Menu {
+                                Button {
+                                    copyHistoryPrompt(entry.query)
+                                } label: {
+                                    Label("Copy prompt", systemImage: "doc.on.doc")
+                                }
+                                Button(role: .destructive) {
+                                    deleteHistoryEntry(entry)
+                                } label: {
+                                    Label("Delete conversation", systemImage: "trash")
+                                }
+                            } label: {
+                                Image(systemName: "ellipsis")
+                                    .font(.system(size: 14, weight: .bold))
+                                    .foregroundStyle(.white.opacity(0.55))
+                                    .frame(width: 34, height: 36)
+                            }
+                            .menuStyle(.borderlessButton)
                         }
-                        .buttonStyle(.plain)
                         .background(PandaPalette.panel.opacity(0.7), in: RoundedRectangle(cornerRadius: 14))
                     }
                 }.padding(.top, 16)
@@ -302,6 +326,55 @@ struct ContentView: View {
     }
 
     private func resetTask() { prompt = ""; results = []; searchError = nil; didSearch = false; isShowingImageIndex = false }
+
+    private func restoreHistory(_ entry: SearchHistoryEntry) {
+        // Restore the exact result snapshot instead of issuing a new search.
+        // This makes history behave like a conversation: the user sees the
+        // result grid they saw then, even while a full-library scan continues.
+        results = entry.results.map(\.searchResult)
+        prompt = ""
+        searchError = nil
+        didSearch = true
+        isShowingImageIndex = false
+        isPromptFocused = false
+        brainStatus = entry.results.isEmpty
+            ? "Restored search — no matching files were found"
+            : "Restored \(entry.results.count) saved result\(entry.results.count == 1 ? "" : "s")"
+    }
+
+    private func copyHistoryPrompt(_ query: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(query, forType: .string)
+        brainStatus = "Copied previous prompt"
+    }
+
+    private func deleteHistoryEntry(_ entry: SearchHistoryEntry) {
+        history.removeAll { $0.id == entry.id }
+        persistHistory()
+        brainStatus = "Deleted saved conversation"
+    }
+
+    private func loadSavedHistoryIfNeeded() {
+        guard !didLoadSavedHistory else { return }
+        didLoadSavedHistory = true
+        guard !savedHistoryData.isEmpty,
+              let decoded = try? JSONDecoder().decode([SearchHistoryEntry].self, from: savedHistoryData) else { return }
+        history = decoded
+    }
+
+    private func saveSearchHistory(query: String, results: [SearchResult]) {
+        history.append(SearchHistoryEntry(query: query, results: results))
+        // Bound the number of conversations so the local preference remains
+        // fast to load while still retaining a useful recent history.
+        if history.count > 30 {
+            history.removeFirst(history.count - 30)
+        }
+        persistHistory()
+    }
+
+    private func persistHistory() {
+        savedHistoryData = (try? JSONEncoder().encode(history)) ?? Data()
+    }
 
     private func addLibraryFolder() {
         Task {
@@ -518,8 +591,7 @@ struct ContentView: View {
     private func submitPrompt() {
         let query = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !query.isEmpty, !isSearching else { return }
-        history.append(query)
-        prompt = "" // The request stays in history; the workspace shows only results.
+        prompt = ""
 
         // An action prompt operates on the numbered results currently on
         // screen. This makes “rename the 2nd to this” deterministic: Panda
@@ -561,7 +633,9 @@ struct ContentView: View {
                 brainStatus = modelStatus?.available == true
                     ? "Panda brain is understanding your files…"
                     : "Searching your local library…"
-                results = try await apiService.search(query: query, limit: 50).results
+                let foundResults = try await apiService.search(query: query, limit: 50).results
+                results = foundResults
+                saveSearchHistory(query: query, results: foundResults)
                 searchError = nil
             } catch {
                 // Never turn a transport/decoding failure into the misleading
@@ -1194,6 +1268,65 @@ private enum FinderFileActions {
             index += 1
         }
         return candidate
+    }
+}
+
+/// A memory-efficient search-history conversation. Images are represented by
+/// their local file path and a small result record — Panda never duplicates
+/// image data in history just to reopen a prior result grid.
+private struct SearchHistoryEntry: Identifiable, Codable {
+    let id: UUID
+    let query: String
+    let results: [SearchHistoryResult]
+
+    init(query: String, results: [SearchResult]) {
+        id = UUID()
+        self.query = query
+        self.results = results.map(SearchHistoryResult.init)
+    }
+}
+
+private struct SearchHistoryResult: Identifiable, Codable {
+    let id: String
+    let content: String
+    let fileName: String
+    let filePath: String
+    let mediaType: MediaType?
+    let thumbnailPath: String?
+    let score: Double
+    let matchReason: String?
+
+    init(_ result: SearchResult) {
+        id = result.id
+        fileName = result.fileName
+        filePath = result.filePath
+        mediaType = result.mediaType
+        thumbnailPath = result.thumbnailPath
+        score = result.score
+        matchReason = result.matchReason
+
+        if result.mediaType == .image {
+            // LocalResultPreview loads this file on demand using filePath. Do
+            // not retain a large VLM caption or image bytes for history.
+            content = "[saved image result] \(result.fileName)"
+        } else {
+            // Text/audio previews remain useful in a restored conversation,
+            // but are capped so many history entries stay inexpensive.
+            content = String(result.content.prefix(600))
+        }
+    }
+
+    var searchResult: SearchResult {
+        SearchResult(
+            id: id,
+            content: content,
+            fileName: fileName,
+            filePath: filePath,
+            mediaType: mediaType,
+            thumbnailPath: thumbnailPath,
+            score: score,
+            matchReason: matchReason
+        )
     }
 }
 
