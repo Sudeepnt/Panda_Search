@@ -19,6 +19,7 @@ struct ContentView: View {
     @State private var libraryStatus: String?
     @State private var brainStatus = "Panda Intelligence is ready for your task"
     @State private var isShowingImageIndex = false
+    @State private var pendingFileAction: PendingFileAction?
     // This is intentionally completion-based: an app restart or interrupted
     // scan must resume on the next prompt instead of permanently looking done.
     @AppStorage("PandaIntelligence.HasCompletedLibraryIndex") private var hasCompletedLibraryIndex = false
@@ -41,6 +42,16 @@ struct ContentView: View {
         .frame(minWidth: 1000, minHeight: 680)
         .background(PandaPalette.canvas)
         .preferredColorScheme(.dark)
+        .alert(item: $pendingFileAction) { pending in
+            Alert(
+                title: Text(pending.title),
+                message: Text(pending.message),
+                primaryButton: pending.isDestructive
+                    ? .destructive(Text("Confirm")) { executeFileAction(pending.action) }
+                    : .default(Text("Confirm")) { executeFileAction(pending.action) },
+                secondaryButton: .cancel()
+            )
+        }
         .task {
             // Reconcile the derived table on every launch. This is cheap for
             // the local metadata store and removes deleted, hidden, excluded,
@@ -217,6 +228,11 @@ struct ContentView: View {
                 Image(systemName: results.isEmpty ? "magnifyingglass" : "sparkles").foregroundStyle(PandaPalette.mint)
                 Text(results.isEmpty ? "Search complete" : "Done — \(results.count) relevant files found").font(.system(size: 16, weight: .semibold))
                 Spacer()
+                if !results.isEmpty {
+                    Text("Use result numbers for actions")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.42))
+                }
                 Image(systemName: results.isEmpty ? "minus.circle" : "checkmark.circle.fill").foregroundStyle(results.isEmpty ? .white.opacity(0.45) : PandaPalette.mint)
             }.padding(22)
             if results.isEmpty {
@@ -228,11 +244,13 @@ struct ContentView: View {
                     columns: [GridItem(.adaptive(minimum: 310), spacing: 14)],
                     spacing: 14
                 ) {
-                    ForEach(results) { result in
+                    ForEach(Array(results.enumerated()), id: \.element.id) { index, result in
                         TaskResultRow(
                             result: result,
+                            serial: index + 1,
                             onOpen: { NSWorkspace.shared.open(URL(fileURLWithPath: result.filePath)) },
-                            onShowInFinder: { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: result.filePath)]) }
+                            onShowInFinder: { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: result.filePath)]) },
+                            onAction: { action in handleResultAction(action, result: result, serial: index + 1) }
                         )
                     }
                 }
@@ -452,6 +470,16 @@ struct ContentView: View {
         guard !query.isEmpty, !isSearching else { return }
         history.append(query)
         prompt = "" // The request stays in history; the workspace shows only results.
+
+        // An action prompt operates on the numbered results currently on
+        // screen. This makes “rename the 2nd to this” deterministic: Panda
+        // resolves the ordinal against the exact result order the user sees,
+        // then asks for confirmation before changing the Finder file.
+        if let action = FinderPromptActionParser.parse(query, results: results) {
+            pendingFileAction = PendingFileAction(action: action)
+            return
+        }
+
         didSearch = true
         isSearching = true
         brainStatus = "Loading Panda brain…"
@@ -477,6 +505,60 @@ struct ContentView: View {
             brainStatus = results.isEmpty
                 ? "Panda Intelligence is ready for your task"
                 : "Panda found \(results.count) relevant file\(results.count == 1 ? "" : "s")"
+        }
+    }
+
+    private func handleResultAction(_ action: ResultCardAction, result: SearchResult, serial: Int) {
+        switch action {
+        case .open:
+            NSWorkspace.shared.open(URL(fileURLWithPath: result.filePath))
+        case .showInFinder:
+            NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: result.filePath)])
+        case .quickLook:
+            FinderFileActions.quickLook(result.filePath)
+        case .copy:
+            FinderFileActions.copyToPasteboard(result.filePath)
+            brainStatus = "Copied \(result.fileName)"
+        case .copyPath:
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(result.filePath, forType: .string)
+            brainStatus = "Copied path for \(result.fileName)"
+        case .rename:
+            prompt = "rename \(serial) to "
+            brainStatus = "Tell Panda the new name for result \(serial)"
+        case .move:
+            prompt = "move \(serial) to "
+            brainStatus = "Tell Panda the destination folder for result \(serial)"
+        case .openWith:
+            prompt = "open (serial) with "
+            brainStatus = "Tell Panda which app should open result (serial)"
+        case .duplicate, .compress, .uncompress, .tag, .trash, .getInfo:
+            if let action = FinderPromptActionParser.directAction(action, result: result) {
+                pendingFileAction = PendingFileAction(action: action)
+            }
+        }
+    }
+
+    private func executeFileAction(_ action: FinderPromptAction) {
+        Task { @MainActor in
+            do {
+                let outcome = try await FinderFileActions.execute(
+                    action,
+                    apiService: apiService,
+                    indexingService: indexingService
+                )
+                if let oldPath = outcome.oldPath,
+                   let index = results.firstIndex(where: { $0.filePath == oldPath }) {
+                    if let updated = outcome.updatedResult {
+                        results[index] = updated
+                    } else {
+                        results.remove(at: index)
+                    }
+                }
+                brainStatus = outcome.message
+            } catch {
+                brainStatus = "Panda could not complete that action: \(error.localizedDescription)"
+            }
         }
     }
 }
@@ -614,10 +696,457 @@ private extension Array {
     }
 }
 
+/// Actions exposed by every result card. More involved actions can be
+/// expressed in the prompt so Panda can resolve a destination/name naturally.
+private enum ResultCardAction {
+    case open
+    case showInFinder
+    case quickLook
+    case openWith
+    case copy
+    case copyPath
+    case rename
+    case move
+    case duplicate
+    case compress
+    case uncompress
+    case tag
+    case trash
+    case getInfo
+}
+
+private enum FinderPromptAction {
+    case open(SearchResult)
+    case openWith(SearchResult, String)
+    case reveal(SearchResult)
+    case copy(SearchResult)
+    case copyTo(SearchResult, URL)
+    case rename(SearchResult, String)
+    case move(SearchResult, URL)
+    case duplicate(SearchResult)
+    case compress(SearchResult)
+    case uncompress(SearchResult)
+    case tag(SearchResult, String)
+    case trash(SearchResult)
+    case getInfo(SearchResult)
+    case createFolder(String, URL)
+}
+
+private struct PendingFileAction: Identifiable {
+    let id = UUID()
+    let action: FinderPromptAction
+
+    var isDestructive: Bool {
+        if case .trash = action { return true }
+        return false
+    }
+
+    var title: String {
+        switch action {
+        case .open: return "Open file?"
+        case .openWith: return "Open file with this app?"
+        case .reveal: return "Show in Finder?"
+        case .copy: return "Copy file?"
+        case .copyTo: return "Copy file to this folder?"
+        case .rename: return "Rename file?"
+        case .move: return "Move file?"
+        case .duplicate: return "Duplicate file?"
+        case .compress: return "Compress file?"
+        case .uncompress: return "Uncompress archive?"
+        case .tag: return "Add Panda tag?"
+        case .trash: return "Move file to Trash?"
+        case .getInfo: return "Open Finder info?"
+        case .createFolder: return "Create folder?"
+        }
+    }
+
+    var message: String {
+        switch action {
+        case .open(let result), .openWith(let result, _), .reveal(let result), .copy(let result),
+             .copyTo(let result, _),
+             .duplicate(let result), .compress(let result), .uncompress(let result), .trash(let result),
+             .getInfo(let result):
+            return result.filePath
+        case .rename(let result, let name):
+            return "Rename \(result.fileName) to \(name)?\n\(result.filePath)"
+        case .move(let result, let destination):
+            return "Move \(result.fileName) to:\n\(destination.path)"
+        case .tag(let result, let tag):
+            return "Add the tag “\(tag)” to:\n\(result.filePath)"
+        case .createFolder(let name, let location):
+            return "Create “\(name)” in:\n\(location.path)"
+        }
+    }
+}
+
+/// Small, local parser for the Finder verbs people use most often. Search
+/// itself remains AI-ranked; these mutations use explicit ordinal resolution
+/// so a command cannot accidentally target a different result after reordering.
+private enum FinderPromptActionParser {
+    static func parse(_ prompt: String, results: [SearchResult]) -> FinderPromptAction? {
+        let normalized = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lower = normalized.lowercased()
+
+        if let folderName = capture(afterAny: ["create a folder called", "create folder called", "new folder called", "make a folder called"], in: normalized),
+           !folderName.isEmpty {
+            return .createFolder(cleanName(folderName), FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Desktop"))
+        }
+
+        guard let result = selectedResult(from: lower, results: results) else { return nil }
+        if lower.hasPrefix("open ") || lower.hasPrefix("launch ") || lower.contains(" open ") {
+            if let app = capture(afterAny: [" with "], in: normalized), !app.isEmpty {
+                return .openWith(result, cleanName(app))
+            }
+            return .open(result)
+        }
+        if lower.contains("show in finder") || lower.contains("reveal in finder") || lower.contains("where is ") {
+            return .reveal(result)
+        }
+        if lower.hasPrefix("copy ") || lower.contains(" copy ") {
+            if let destinationText = capture(afterAny: [" to ", " into "], in: normalized),
+               !destinationText.isEmpty,
+               let destination = resolveFolder(destinationText) {
+                return .copyTo(result, destination)
+            }
+            return .copy(result)
+        }
+        if lower.contains("rename") || lower.contains("renamed") {
+            guard let requestedName = capture(afterAny: [" to ", " as ", " called ", " name ", " named "], in: normalized),
+                  !requestedName.isEmpty else { return nil }
+            return .rename(result, normalizedName(requestedName, source: result.fileName))
+        }
+        if lower.contains("move") || lower.contains("put ") || lower.contains("place ") {
+            guard let destinationText = capture(afterAny: [" to ", " into ", " in "], in: normalized),
+                  let destination = resolveFolder(destinationText) else { return nil }
+            return .move(result, destination)
+        }
+        if lower.contains("duplicate") || lower.contains("make a copy") {
+            return .duplicate(result)
+        }
+        if lower.contains("uncompress") || lower.contains("unzip") || lower.contains("extract") {
+            return .uncompress(result)
+        }
+        if lower.contains("compress") || lower.contains("zip ") || lower.contains("archive ") {
+            return .compress(result)
+        }
+        if lower.contains("tag ") || lower.contains("label ") {
+            let tag = capture(afterAny: ["tag as ", "tag it ", "label as ", "label it "], in: normalized) ?? "Panda"
+            return .tag(result, cleanName(tag))
+        }
+        if lower.contains("trash") || lower.contains("delete ") || lower.contains("remove ") {
+            return .trash(result)
+        }
+        if lower.contains("get info") || lower.contains("information") {
+            return .getInfo(result)
+        }
+        return nil
+    }
+
+    static func directAction(_ action: ResultCardAction, result: SearchResult) -> FinderPromptAction? {
+        switch action {
+        case .open: return .open(result)
+        case .showInFinder: return .reveal(result)
+        case .quickLook: return .open(result)
+        case .openWith: return nil
+        case .copy: return .copy(result)
+        case .duplicate: return .duplicate(result)
+        case .compress: return .compress(result)
+        case .uncompress: return .uncompress(result)
+        case .tag: return .tag(result, "Panda")
+        case .trash: return .trash(result)
+        case .getInfo: return .getInfo(result)
+        case .copyPath, .rename, .move: return nil
+        }
+    }
+
+    private static func selectedResult(from lowerPrompt: String, results: [SearchResult]) -> SearchResult? {
+        guard !results.isEmpty else { return nil }
+        if let number = ordinal(in: lowerPrompt), results.indices.contains(number - 1) {
+            return results[number - 1]
+        }
+        if lowerPrompt.contains("last result") || lowerPrompt.contains("last file") {
+            return results.last
+        }
+        // A single visible result is an unambiguous target even when the user
+        // says “rename this file” instead of spelling out “1st”.
+        return results.count == 1 ? results[0] : nil
+    }
+
+    private static func ordinal(in prompt: String) -> Int? {
+        let words: [String: Int] = [
+            "first": 1, "1st": 1, "second": 2, "2nd": 2, "third": 3, "3rd": 3,
+            "fourth": 4, "4th": 4, "fifth": 5, "5th": 5, "sixth": 6, "6th": 6,
+            "seventh": 7, "7th": 7, "eighth": 8, "8th": 8, "ninth": 9, "9th": 9,
+            "tenth": 10, "10th": 10
+        ]
+        for token in prompt.split(whereSeparator: { $0 == " " || $0 == "\t" || $0 == "\n" }) {
+            let cleaned = token.trimmingCharacters(in: .punctuationCharacters)
+            if let value = words[String(cleaned)] { return value }
+            if let value = Int(cleaned), value > 0 { return value }
+        }
+        return nil
+    }
+
+    private static func capture(afterAny markers: [String], in text: String) -> String? {
+        let lower = text.lowercased()
+        guard let match = markers.compactMap({ marker -> (Int, String)? in
+            guard let range = lower.range(of: marker) else { return nil }
+            return (range.upperBound.utf16Offset(in: lower), marker)
+        }).min(by: { $0.0 < $1.0 }) else { return nil }
+        let start = text.index(text.startIndex, offsetBy: match.0)
+        return String(text[start...]).trimmingCharacters(in: .whitespacesAndNewlines.union(.punctuationCharacters))
+    }
+
+    private static func cleanName(_ text: String) -> String {
+        text.trimmingCharacters(in: .whitespacesAndNewlines.union(.punctuationCharacters))
+            .replacingOccurrences(of: "\"", with: "")
+            .replacingOccurrences(of: "'", with: "")
+    }
+
+    private static func normalizedName(_ requested: String, source: String) -> String {
+        let requested = cleanName(requested)
+        guard !requested.contains("/"), !requested.contains("\\") else { return requested }
+        let sourceExtension = URL(fileURLWithPath: source).pathExtension
+        if !sourceExtension.isEmpty && URL(fileURLWithPath: requested).pathExtension.isEmpty {
+            return "\(requested).\(sourceExtension)"
+        }
+        return requested
+    }
+
+    private static func resolveFolder(_ text: String) -> URL? {
+        let cleaned = cleanName(text)
+            .replacingOccurrences(of: "folder called ", with: "", options: .caseInsensitive)
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        if cleaned.hasPrefix("/") {
+            let absolute = URL(fileURLWithPath: cleaned).standardizedFileURL
+            // Panda's current library is deliberately local-user-only. Do
+            // not let a natural-language move escape into removable drives,
+            // network shares, or cloud mounts.
+            return absolute.path == home.path || absolute.path.hasPrefix(home.path + "/") ? absolute : nil
+        }
+        let known: [String: URL] = [
+            "desktop": home.appendingPathComponent("Desktop"),
+            "documents": home.appendingPathComponent("Documents"),
+            "downloads": home.appendingPathComponent("Downloads"),
+            "pictures": home.appendingPathComponent("Pictures"),
+            "music": home.appendingPathComponent("Music"),
+            "movies": home.appendingPathComponent("Movies")
+        ]
+        if let knownFolder = known[cleaned.lowercased()] { return knownFolder }
+        let candidates = [home.appendingPathComponent(cleaned), home.appendingPathComponent("Desktop").appendingPathComponent(cleaned)]
+        return candidates.first(where: { FileManager.default.fileExists(atPath: $0.path) && (try? $0.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true })
+    }
+}
+
+private struct FinderActionOutcome {
+    let message: String
+    let oldPath: String?
+    let updatedResult: SearchResult?
+}
+
+private enum FinderFileActions {
+    static func copyToPasteboard(_ path: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.writeObjects([NSURL(fileURLWithPath: path)])
+    }
+
+    static func quickLook(_ path: String) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/qlmanage")
+        process.arguments = ["-p", path]
+        try? process.run()
+    }
+
+    static func execute(
+        _ action: FinderPromptAction,
+        apiService: APIService,
+        indexingService: DocumentIndexingService
+    ) async throws -> FinderActionOutcome {
+        let fileManager = FileManager.default
+
+        switch action {
+        case .open(let result):
+            NSWorkspace.shared.open(URL(fileURLWithPath: result.filePath))
+            return FinderActionOutcome(message: "Opened \(result.fileName)", oldPath: nil, updatedResult: nil)
+
+        case .openWith(let result, let appName):
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+            process.arguments = ["-a", appName, result.filePath]
+            try process.run()
+            return FinderActionOutcome(message: "Opened \(result.fileName) with \(appName)", oldPath: nil, updatedResult: nil)
+
+        case .reveal(let result):
+            NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: result.filePath)])
+            return FinderActionOutcome(message: "Showing \(result.fileName) in Finder", oldPath: nil, updatedResult: nil)
+
+        case .copy(let result):
+            copyToPasteboard(result.filePath)
+            return FinderActionOutcome(message: "Copied \(result.fileName) — paste it anywhere in Finder", oldPath: nil, updatedResult: nil)
+
+        case .copyTo(let result, let destinationFolder):
+            let source = URL(fileURLWithPath: result.filePath)
+            guard fileManager.fileExists(atPath: destinationFolder.path) else {
+                throw FinderActionError.destinationMissing(destinationFolder.path)
+            }
+            let destination = destinationFolder.appendingPathComponent(source.lastPathComponent)
+            try validateSource(source, destination: destination, fileManager: fileManager)
+            try fileManager.copyItem(at: source, to: destination)
+            _ = await indexingService.indexFilesIfNeededConcurrent([destination], maxConcurrency: 1, forceReindex: true)
+            return FinderActionOutcome(message: "Copied \(result.fileName) to \(destinationFolder.lastPathComponent)", oldPath: nil, updatedResult: nil)
+
+        case .rename(let result, let requestedName):
+            let source = URL(fileURLWithPath: result.filePath)
+            let destination = source.deletingLastPathComponent().appendingPathComponent(requestedName)
+            try validateSource(source, destination: destination, fileManager: fileManager)
+            try fileManager.moveItem(at: source, to: destination)
+            try? await apiService.deleteDocument(id: result.id)
+            _ = await indexingService.indexFilesIfNeededConcurrent([destination], maxConcurrency: 1, forceReindex: true)
+            let updated = SearchResult(
+                id: result.id,
+                content: result.content,
+                fileName: destination.lastPathComponent,
+                filePath: destination.path,
+                mediaType: result.mediaType,
+                thumbnailPath: result.thumbnailPath,
+                score: result.score
+            )
+            return FinderActionOutcome(message: "Renamed to \(destination.lastPathComponent)", oldPath: result.filePath, updatedResult: updated)
+
+        case .move(let result, let destinationFolder):
+            let source = URL(fileURLWithPath: result.filePath)
+            let folder = destinationFolder
+            if !fileManager.fileExists(atPath: folder.path) {
+                throw FinderActionError.destinationMissing(folder.path)
+            }
+            let destination = folder.appendingPathComponent(source.lastPathComponent)
+            try validateSource(source, destination: destination, fileManager: fileManager)
+            try fileManager.moveItem(at: source, to: destination)
+            try? await apiService.deleteDocument(id: result.id)
+            _ = await indexingService.indexFilesIfNeededConcurrent([destination], maxConcurrency: 1, forceReindex: true)
+            let updated = SearchResult(
+                id: result.id,
+                content: result.content,
+                fileName: destination.lastPathComponent,
+                filePath: destination.path,
+                mediaType: result.mediaType,
+                thumbnailPath: result.thumbnailPath,
+                score: result.score
+            )
+            return FinderActionOutcome(message: "Moved \(result.fileName) to \(folder.lastPathComponent)", oldPath: result.filePath, updatedResult: updated)
+
+        case .duplicate(let result):
+            let source = URL(fileURLWithPath: result.filePath)
+            let destination = uniqueCopyURL(for: source, fileManager: fileManager)
+            try validateSource(source, destination: destination, fileManager: fileManager)
+            try fileManager.copyItem(at: source, to: destination)
+            _ = await indexingService.indexFilesIfNeededConcurrent([destination], maxConcurrency: 1, forceReindex: true)
+            return FinderActionOutcome(message: "Duplicated as \(destination.lastPathComponent)", oldPath: nil, updatedResult: nil)
+
+        case .compress(let result):
+            let source = URL(fileURLWithPath: result.filePath)
+            let archive = source.deletingPathExtension().appendingPathExtension("zip")
+            let output = uniqueCopyURL(for: archive, fileManager: fileManager)
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+            process.arguments = ["-c", "-k", "--sequesterRsrc", "--keepParent", source.path, output.path]
+            try process.run()
+            process.waitUntilExit()
+            guard process.terminationStatus == 0 else { throw FinderActionError.commandFailed("compress") }
+            _ = await indexingService.indexFilesIfNeededConcurrent([output], maxConcurrency: 1, forceReindex: true)
+            return FinderActionOutcome(message: "Compressed to \(output.lastPathComponent)", oldPath: nil, updatedResult: nil)
+
+        case .uncompress(let result):
+            let source = URL(fileURLWithPath: result.filePath)
+            let destination = source.deletingPathExtension()
+            let output = uniqueCopyURL(for: destination, fileManager: fileManager)
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+            process.arguments = ["-x", "-k", source.path, output.path]
+            try process.run()
+            process.waitUntilExit()
+            guard process.terminationStatus == 0 else { throw FinderActionError.commandFailed("uncompress") }
+            return FinderActionOutcome(message: "Uncompressed into \(output.lastPathComponent)", oldPath: nil, updatedResult: nil)
+
+        case .tag(let result, let tag):
+            let url = URL(fileURLWithPath: result.filePath)
+            var tags = (try? url.resourceValues(forKeys: [.tagNamesKey]).tagNames) ?? []
+            if !tags.contains(tag) { tags.append(tag) }
+            // tagNames is read-only on URLResourceValues; Finder writes it
+            // through the resource-value key API instead.
+            try (url as NSURL).setResourceValue(tags, forKey: URLResourceKey.tagNamesKey)
+            return FinderActionOutcome(message: "Tagged \(result.fileName) as \(tag)", oldPath: nil, updatedResult: nil)
+
+        case .trash(let result):
+            var resultingURL: NSURL?
+            try fileManager.trashItem(at: URL(fileURLWithPath: result.filePath), resultingItemURL: &resultingURL)
+            try? await apiService.deleteDocument(id: result.id)
+            return FinderActionOutcome(message: "Moved \(result.fileName) to Trash", oldPath: result.filePath, updatedResult: nil)
+
+        case .getInfo(let result):
+            let escaped = result.filePath.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+            let source = "tell application \"Finder\" to open information window of POSIX file \"\(escaped)\""
+            var error: NSDictionary?
+            NSAppleScript(source: source)?.executeAndReturnError(&error)
+            if let error { throw FinderActionError.commandFailed(error.description) }
+            return FinderActionOutcome(message: "Opened Finder info for \(result.fileName)", oldPath: nil, updatedResult: nil)
+
+        case .createFolder(let name, let location):
+            let folder = location.appendingPathComponent(name)
+            if fileManager.fileExists(atPath: folder.path) { throw FinderActionError.destinationExists(folder.path) }
+            try fileManager.createDirectory(at: folder, withIntermediateDirectories: false)
+            return FinderActionOutcome(message: "Created folder \(name)", oldPath: nil, updatedResult: nil)
+        }
+    }
+
+    private static func validateSource(_ source: URL, destination: URL, fileManager: FileManager) throws {
+        guard fileManager.fileExists(atPath: source.path) else { throw FinderActionError.sourceMissing(source.path) }
+        guard source.standardizedFileURL != destination.standardizedFileURL else { throw FinderActionError.sameLocation }
+        guard !fileManager.fileExists(atPath: destination.path) else { throw FinderActionError.destinationExists(destination.path) }
+    }
+
+    private static func uniqueCopyURL(for original: URL, fileManager: FileManager) -> URL {
+        let directory = original.deletingLastPathComponent()
+        let ext = original.pathExtension
+        let stem = original.deletingPathExtension().lastPathComponent
+        var index = 1
+        var candidate = original
+        while fileManager.fileExists(atPath: candidate.path) {
+            let suffix = index == 1 ? " copy" : " copy \(index)"
+            let name = stem + suffix
+            candidate = ext.isEmpty
+                ? directory.appendingPathComponent(name)
+                : directory.appendingPathComponent(name).appendingPathExtension(ext)
+            index += 1
+        }
+        return candidate
+    }
+}
+
+private enum FinderActionError: LocalizedError {
+    case sourceMissing(String)
+    case destinationMissing(String)
+    case destinationExists(String)
+    case sameLocation
+    case commandFailed(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .sourceMissing(let path): return "Source file is missing: \(path)"
+        case .destinationMissing(let path): return "Destination folder does not exist: \(path)"
+        case .destinationExists(let path): return "A file already exists at: \(path)"
+        case .sameLocation: return "The source and destination are the same."
+        case .commandFailed(let command): return "Finder action failed: \(command)"
+        }
+    }
+}
+
 private struct TaskResultRow: View {
     let result: SearchResult
+    let serial: Int
     let onOpen: () -> Void
     let onShowInFinder: () -> Void
+    let onAction: (ResultCardAction) -> Void
 
     private var summary: String {
         let compact = result.content
@@ -643,8 +1172,17 @@ private struct TaskResultRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 13) {
             HStack(alignment: .top, spacing: 12) {
-                LocalResultPreview(result: result)
-                    .frame(width: 58, height: 58)
+                ZStack(alignment: .bottomTrailing) {
+                    LocalResultPreview(result: result)
+                        .frame(width: 58, height: 58)
+                    Text("\(serial)")
+                        .font(.system(size: 10, weight: .bold, design: .rounded))
+                        .foregroundStyle(PandaPalette.canvas)
+                        .frame(width: 19, height: 19)
+                        .background(PandaPalette.mint, in: Circle())
+                        .overlay(Circle().stroke(PandaPalette.panel, lineWidth: 2))
+                        .offset(x: 5, y: 5)
+                }
                 VStack(alignment: .leading, spacing: 5) {
                     Text(result.fileName)
                         .font(.system(size: 15, weight: .semibold))
@@ -680,6 +1218,28 @@ private struct TaskResultRow: View {
                 }
                 .buttonStyle(.bordered)
                 .tint(PandaPalette.mint.opacity(0.7))
+
+                Menu {
+                    Button { onAction(.quickLook) } label: { Label("Quick Look", systemImage: "eye") }
+                    Button { onAction(.openWith) } label: { Label("Open With…", systemImage: "square.and.arrow.up") }
+                    Button { onAction(.copy) } label: { Label("Copy", systemImage: "doc.on.doc") }
+                    Button { onAction(.copyPath) } label: { Label("Copy Path", systemImage: "link") }
+                    Divider()
+                    Button { onAction(.rename) } label: { Label("Rename with Panda…", systemImage: "pencil") }
+                    Button { onAction(.move) } label: { Label("Move with Panda…", systemImage: "folder") }
+                    Button { onAction(.duplicate) } label: { Label("Duplicate", systemImage: "plus.square.on.square") }
+                    Button { onAction(.compress) } label: { Label("Compress", systemImage: "archivebox") }
+                    Button { onAction(.uncompress) } label: { Label("Uncompress", systemImage: "archivebox.fill") }
+                    Button { onAction(.tag) } label: { Label("Add Panda tag", systemImage: "tag") }
+                    Divider()
+                    Button(role: .destructive) { onAction(.trash) } label: { Label("Move to Trash", systemImage: "trash") }
+                    Button { onAction(.getInfo) } label: { Label("Get Info", systemImage: "info.circle") }
+                } label: {
+                    Image(systemName: "ellipsis.circle")
+                        .font(.system(size: 17, weight: .semibold))
+                }
+                .menuStyle(.borderlessButton)
+                .tint(PandaPalette.mint.opacity(0.8))
             }
         }
         .padding(16)
