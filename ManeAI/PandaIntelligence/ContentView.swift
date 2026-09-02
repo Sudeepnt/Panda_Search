@@ -42,20 +42,32 @@ struct ContentView: View {
 
     var body: some View {
         ZStack {
-            LinearGradient(
-                colors: [PandaPalette.canvas, PandaPalette.backdrop, PandaPalette.canvas],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
-            )
+            ZStack {
+                PandaPalette.canvas
+                Circle()
+                    .fill(PandaPalette.mint.opacity(0.12))
+                    .frame(width: 360, height: 360)
+                    .blur(radius: 90)
+                    .offset(x: -300, y: -250)
+                Circle()
+                    .fill(Color(red: 0.38, green: 0.31, blue: 0.52).opacity(0.10))
+                    .frame(width: 420, height: 420)
+                    .blur(radius: 110)
+                    .offset(x: 360, y: 280)
+                LinearGradient(
+                    colors: [PandaPalette.canvas.opacity(0.35), PandaPalette.backdrop.opacity(0.16), PandaPalette.canvas.opacity(0.55)],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                )
+            }
+            .ignoresSafeArea()
             VStack(spacing: 14) {
                 applicationNavigation
                 HStack(alignment: .top, spacing: 14) {
                     sidebar
                     workspace
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        .background(PandaPalette.workspace)
-                        .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
-                        .overlay(RoundedRectangle(cornerRadius: 24, style: .continuous).stroke(PandaPalette.strokeStrong))
+                        .glassPanel(cornerRadius: 24, tint: PandaPalette.workspace)
                 }
             }
             .padding(14)
@@ -112,14 +124,12 @@ struct ContentView: View {
                     .padding(.vertical, 9)
             }
             .buttonStyle(.plain)
-            .background(PandaPalette.elevated, in: Capsule())
-            .overlay(Capsule().stroke(PandaPalette.strokeStrong))
+            .glassCapsule(tint: PandaPalette.elevated)
             pandaAvatar(34)
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 11)
-        .background(PandaPalette.topbar.opacity(0.94), in: RoundedRectangle(cornerRadius: 20, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 20, style: .continuous).stroke(PandaPalette.strokeStrong))
+        .glassPanel(cornerRadius: 20, tint: PandaPalette.topbar)
     }
 
     private func navButton(_ title: String, icon: String, isActive: Bool, action: @escaping () -> Void) -> some View {
@@ -159,8 +169,7 @@ struct ContentView: View {
                     .frame(maxWidth: .infinity).padding(.vertical, 13)
             }
             .buttonStyle(.plain)
-            .background(PandaPalette.elevated, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-            .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(PandaPalette.strokeStrong))
+            .glassPanel(cornerRadius: 14, tint: PandaPalette.elevated)
             .padding(.top, 14)
 
             HStack(spacing: 8) {
@@ -245,9 +254,7 @@ struct ContentView: View {
         .padding(16)
         .frame(width: 290)
         .frame(maxHeight: .infinity)
-        .background(PandaPalette.sidebar)
-        .clipShape(RoundedRectangle(cornerRadius: 26, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 26, style: .continuous).stroke(PandaPalette.stroke))
+        .glassPanel(cornerRadius: 26, tint: PandaPalette.sidebar)
     }
 
     private func sidebarMetric(_ title: String, value: String, icon: String) -> some View {
@@ -258,8 +265,7 @@ struct ContentView: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(12)
-        .background(PandaPalette.panel.opacity(0.82), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(PandaPalette.stroke))
+        .glassPanel(cornerRadius: 14, tint: PandaPalette.panel)
     }
 
     @ViewBuilder
@@ -308,8 +314,7 @@ struct ContentView: View {
                     .font(.system(size: 12, weight: .medium)).foregroundStyle(.white.opacity(0.66))
             }
             .padding(.horizontal, 12).padding(.vertical, 9)
-            .background(PandaPalette.panel, in: Capsule())
-            .overlay(Capsule().stroke(PandaPalette.stroke))
+            .glassCapsule(tint: PandaPalette.panel)
         }
     }
 
@@ -338,16 +343,14 @@ struct ContentView: View {
             .padding(28)
         }
         .frame(maxWidth: .infinity, minHeight: 380, alignment: .leading)
-        .background(PandaPalette.result, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 20, style: .continuous).stroke(PandaPalette.stroke))
+        .glassPanel(cornerRadius: 20, tint: PandaPalette.result)
     }
 
     private func searchCapability(_ title: String, icon: String) -> some View {
         Label(title, systemImage: icon)
             .font(.system(size: 12, weight: .medium))
             .padding(.horizontal, 12).padding(.vertical, 9)
-            .background(PandaPalette.elevated, in: Capsule())
-            .overlay(Capsule().stroke(PandaPalette.stroke))
+            .glassCapsule(tint: PandaPalette.elevated)
     }
 
     private var resultSubtitle: String {
@@ -369,8 +372,7 @@ struct ContentView: View {
                 .font(.system(size: 16)).foregroundStyle(.white.opacity(0.62))
         }
         .frame(maxWidth: 650, alignment: .leading).padding(25)
-        .background(PandaPalette.result, in: RoundedRectangle(cornerRadius: 23))
-        .overlay(RoundedRectangle(cornerRadius: 23).stroke(.white.opacity(0.08)))
+        .glassPanel(cornerRadius: 23, tint: PandaPalette.result)
     }
 
     private var resultCard: some View {
@@ -409,8 +411,8 @@ struct ContentView: View {
                 .padding(18)
             }
         }
-        .frame(maxWidth: 1280).background(PandaPalette.result, in: RoundedRectangle(cornerRadius: 24))
-        .overlay(RoundedRectangle(cornerRadius: 24).stroke(.white.opacity(0.1)))
+        .frame(maxWidth: 1280)
+        .glassPanel(cornerRadius: 24, tint: PandaPalette.result)
     }
 
     private var resultGridColumns: [GridItem] {
@@ -442,8 +444,7 @@ struct ContentView: View {
             .opacity(prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? 0.45 : 1)
         }
         .padding(10)
-        .background(PandaPalette.elevated, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 20, style: .continuous).stroke(PandaPalette.strokeStrong))
+        .glassPanel(cornerRadius: 20, tint: PandaPalette.elevated)
         .shadow(color: .black.opacity(0.3), radius: 18, y: 8)
     }
 
@@ -1543,7 +1544,8 @@ private struct TaskResultRow: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.horizontal, 10)
                     .padding(.vertical, 8)
-                    .background(PandaPalette.mint.opacity(0.08), in: RoundedRectangle(cornerRadius: 9))
+                    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+                    .background(PandaPalette.mint.opacity(0.12), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
             }
 
             if !summary.isEmpty {
@@ -1596,8 +1598,7 @@ private struct TaskResultRow: View {
         }
         .padding(16)
         .frame(maxWidth: .infinity, minHeight: isExpanded ? 230 : 185, alignment: .topLeading)
-        .background(PandaPalette.panel.opacity(0.72), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).stroke(.white.opacity(0.09)))
+        .glassPanel(cornerRadius: 16, tint: PandaPalette.panel)
     }
 }
 
@@ -1670,8 +1671,7 @@ private struct ImageIndexWorkspace: View {
                     TextField("Search indexed files", text: $filter).textFieldStyle(.plain)
                 }
                 .padding(.horizontal, 13).frame(width: 250, height: 38)
-                .background(PandaPalette.panel, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-                .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(PandaPalette.stroke))
+                .glassPanel(cornerRadius: 12, tint: PandaPalette.panel)
 
                 Picker("View", selection: $viewMode) {
                     ForEach(ImageIndexViewMode.allCases) { mode in
@@ -1680,7 +1680,8 @@ private struct ImageIndexWorkspace: View {
                 }
                 .labelsHidden().pickerStyle(.segmented).frame(width: 150)
             }
-            .padding(.horizontal, 22).padding(.vertical, 16).background(PandaPalette.topbar)
+            .padding(.horizontal, 22).padding(.vertical, 16)
+            .glassPanel(cornerRadius: 0, tint: PandaPalette.topbar)
             Divider().overlay(PandaPalette.stroke)
 
             if images.isEmpty {
@@ -1731,7 +1732,7 @@ private struct ImageIndexWorkspace: View {
                 }
             }
         }
-        .background(PandaPalette.workspace)
+        .background(.clear)
         .preferredColorScheme(.dark)
     }
 
@@ -1765,8 +1766,7 @@ private struct ImageIndexRow: View {
                 .font(.system(size: 11)).foregroundStyle(.white.opacity(0.5)).frame(width: 78, alignment: .leading)
         }
         .padding(.horizontal, 12).padding(.vertical, 10)
-        .background(isSelected ? PandaPalette.mint.opacity(0.12) : PandaPalette.panel.opacity(0.42), in: RoundedRectangle(cornerRadius: 13, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 13, style: .continuous).stroke(isSelected ? PandaPalette.mint.opacity(0.35) : PandaPalette.stroke))
+        .glassPanel(cornerRadius: 13, tint: isSelected ? PandaPalette.mint : PandaPalette.panel)
         .contentShape(Rectangle()).onTapGesture(perform: select)
     }
 }
@@ -1788,8 +1788,7 @@ private struct ImageIndexGridCard: View {
         }
         .padding(10)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(isSelected ? PandaPalette.mint.opacity(0.12) : PandaPalette.panel.opacity(0.5), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).stroke(isSelected ? PandaPalette.mint.opacity(0.4) : PandaPalette.stroke))
+        .glassPanel(cornerRadius: 16, tint: isSelected ? PandaPalette.mint : PandaPalette.panel)
         .contentShape(Rectangle()).onTapGesture(perform: select)
     }
 }
@@ -1821,8 +1820,7 @@ private struct ImageIndexPreview: View {
             Spacer()
         }
         .padding(22)
-        .background(PandaPalette.result, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 20, style: .continuous).stroke(PandaPalette.stroke))
+        .glassPanel(cornerRadius: 20, tint: PandaPalette.result)
     }
 }
 
@@ -1907,6 +1905,44 @@ private struct LocalResultPreview: View {
     }
 }
 
+/// Shared translucent treatment for the dashboard surfaces. The material is
+/// intentionally layered under a quiet tint so the backdrop can show through
+/// without turning text and controls into low-contrast noise.
+private struct GlassPanelModifier: ViewModifier {
+    let cornerRadius: CGFloat
+    let tint: Color
+
+    func body(content: Content) -> some View {
+        let shape = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+        content
+            .background(.ultraThinMaterial, in: shape)
+            .background(tint.opacity(0.48), in: shape)
+            .overlay(shape.stroke(PandaPalette.glassBorder, lineWidth: 1))
+            .shadow(color: .black.opacity(0.24), radius: 16, y: 8)
+    }
+}
+
+private struct GlassCapsuleModifier: ViewModifier {
+    let tint: Color
+
+    func body(content: Content) -> some View {
+        content
+            .background(.ultraThinMaterial, in: Capsule())
+            .background(tint.opacity(0.46), in: Capsule())
+            .overlay(Capsule().stroke(PandaPalette.glassBorder, lineWidth: 1))
+    }
+}
+
+private extension View {
+    func glassPanel(cornerRadius: CGFloat = 20, tint: Color = PandaPalette.panel) -> some View {
+        modifier(GlassPanelModifier(cornerRadius: cornerRadius, tint: tint))
+    }
+
+    func glassCapsule(tint: Color = PandaPalette.panel) -> some View {
+        modifier(GlassCapsuleModifier(tint: tint))
+    }
+}
+
 private enum PandaPalette {
     // Neutral graphite surfaces model the floating vehicle-dashboard
     // reference while Panda's mint remains the single functional accent.
@@ -1921,5 +1957,6 @@ private enum PandaPalette {
     static let glow = Color(red: 0.19, green: 0.23, blue: 0.21)
     static let stroke = Color.white.opacity(0.075)
     static let strokeStrong = Color.white.opacity(0.13)
+    static let glassBorder = Color.white.opacity(0.095)
     static let mint = Color(red: 0.30, green: 0.87, blue: 0.61)
 }
