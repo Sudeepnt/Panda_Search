@@ -41,11 +41,15 @@ struct ContentView: View {
     @AppStorage("PandaIntelligence.ImageScanSessionPrepared") private var imageScanSessionPrepared = false
 
     var body: some View {
-        HStack(spacing: 0) {
+        HStack(alignment: .top, spacing: 12) {
             sidebar
-            Divider().overlay(.white.opacity(0.08))
             workspace
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(PandaPalette.workspace)
+                .clipShape(RoundedRectangle(cornerRadius: 26, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 26, style: .continuous).stroke(PandaPalette.stroke))
         }
+        .padding(12)
         .frame(minWidth: 1000, minHeight: 680)
         .background(PandaPalette.canvas)
         .preferredColorScheme(.dark)
@@ -82,7 +86,7 @@ struct ContentView: View {
                         .font(.system(size: 9, weight: .bold)).tracking(1.1).foregroundStyle(PandaPalette.mint)
                 }
             }
-            .padding(.top, 42)
+            .padding(.top, 22)
 
             Button(action: resetTask) {
                 Label("New Task", systemImage: "plus")
@@ -91,15 +95,20 @@ struct ContentView: View {
                     .background(PandaPalette.panel, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
                     .overlay(RoundedRectangle(cornerRadius: 16).stroke(.white.opacity(0.14)))
             }
-            .buttonStyle(.plain).padding(.top, 44)
+            .buttonStyle(.plain).padding(.top, 32)
 
             Button(action: addLibraryFolder) {
                 Label("Add Library Folder", systemImage: "folder.badge.plus")
                     .font(.system(size: 13, weight: .semibold))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 11)
+                    .contentShape(Rectangle())
             }
-            .buttonStyle(.plain)
-            .foregroundStyle(PandaPalette.mint)
-            .padding(.top, 18)
+            .buttonStyle(.plain).foregroundStyle(PandaPalette.mint)
+            .background(PandaPalette.panel.opacity(0.72), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(PandaPalette.stroke))
+            .padding(.top, 14)
 
             Button {
                 isShowingImageIndex = true
@@ -112,9 +121,10 @@ struct ContentView: View {
             }
             .buttonStyle(.borderless)
             .foregroundStyle(isShowingImageIndex ? PandaPalette.mint : .white.opacity(0.76))
-            .padding(.vertical, 8)
-            .padding(.horizontal, 10)
-            .background(isShowingImageIndex ? PandaPalette.panel : .clear, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+            .padding(.vertical, 11)
+            .padding(.horizontal, 12)
+            .background(isShowingImageIndex ? PandaPalette.elevated : PandaPalette.panel.opacity(0.45), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(PandaPalette.stroke))
             .padding(.top, 8)
 
             Button(action: startFullDiskScan) {
@@ -125,15 +135,16 @@ struct ContentView: View {
             }
             .buttonStyle(.borderless)
             .foregroundStyle(.white.opacity(0.76))
-            .padding(.vertical, 8)
-            .padding(.horizontal, 10)
-            .background(PandaPalette.panel.opacity(0.5), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
-            .padding(.top, 12)
+            .padding(.vertical, 11)
+            .padding(.horizontal, 12)
+            .background(PandaPalette.panel.opacity(0.45), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(PandaPalette.stroke))
+            .padding(.top, 8)
             .disabled(isIndexingLibrary)
 
             Text("HISTORY")
                 .font(.system(size: 11, weight: .semibold)).tracking(1).foregroundStyle(.white.opacity(0.35))
-                .padding(.top, 46)
+                .padding(.top, 32)
 
             ScrollView {
                 LazyVStack(spacing: 8) {
@@ -175,7 +186,8 @@ struct ContentView: View {
                             }
                             .menuStyle(.borderlessButton)
                         }
-                        .background(PandaPalette.panel.opacity(0.7), in: RoundedRectangle(cornerRadius: 14))
+                        .background(PandaPalette.panel.opacity(0.72), in: RoundedRectangle(cornerRadius: 14))
+                        .overlay(RoundedRectangle(cornerRadius: 14).stroke(PandaPalette.stroke))
                     }
                 }.padding(.top, 16)
             }
@@ -188,10 +200,16 @@ struct ContentView: View {
                 Spacer()
                 Image(systemName: "chevron.up.chevron.down").font(.system(size: 10, weight: .bold)).foregroundStyle(.white.opacity(0.55))
             }
-            .padding(12).background(PandaPalette.panel.opacity(0.5), in: RoundedRectangle(cornerRadius: 15))
-            .padding(.bottom, 22)
+            .padding(12).background(PandaPalette.panel.opacity(0.72), in: RoundedRectangle(cornerRadius: 15))
+            .overlay(RoundedRectangle(cornerRadius: 15).stroke(PandaPalette.stroke))
+            .padding(.bottom, 4)
         }
-        .padding(.horizontal, 28).frame(width: 305).background(PandaPalette.sidebar)
+        .padding(.horizontal, 20)
+        .frame(width: 286)
+        .frame(maxHeight: .infinity)
+        .background(PandaPalette.sidebar)
+        .clipShape(RoundedRectangle(cornerRadius: 26, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 26, style: .continuous).stroke(PandaPalette.stroke))
     }
 
     @ViewBuilder
@@ -201,20 +219,30 @@ struct ContentView: View {
         } else {
         VStack(spacing: 0) {
             HStack(spacing: 12) {
-                Circle().fill(PandaPalette.mint).frame(width: 8, height: 8).shadow(color: PandaPalette.mint, radius: 8)
-                Text(topStatus)
-                    .font(.system(size: 16, weight: .medium)).foregroundStyle(.white.opacity(0.72))
+                HStack(spacing: 9) {
+                    Circle().fill(PandaPalette.mint).frame(width: 7, height: 7).shadow(color: PandaPalette.mint, radius: 7)
+                    Text(topStatus)
+                        .font(.system(size: 13, weight: .medium)).foregroundStyle(.white.opacity(0.72))
+                }
+                .padding(.horizontal, 13)
+                .padding(.vertical, 10)
+                .background(PandaPalette.panel.opacity(0.78), in: Capsule())
+                .overlay(Capsule().stroke(PandaPalette.stroke))
                 Spacer()
-                pandaAvatar(58)
+                pandaAvatar(46)
             }
-            .padding(.horizontal, 36).padding(.vertical, 17).background(PandaPalette.topbar)
+            .padding(.horizontal, 20).padding(.vertical, 14).background(PandaPalette.topbar)
             Divider().overlay(.white.opacity(0.07))
 
             ZStack {
-                LinearGradient(colors: [PandaPalette.glow.opacity(0.28), .clear, PandaPalette.mint.opacity(0.05)], startPoint: .topLeading, endPoint: .bottomTrailing)
+                LinearGradient(
+                    colors: [PandaPalette.glow.opacity(0.14), PandaPalette.workspace, PandaPalette.panel.opacity(0.22)],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                )
                 ScrollView {
                     VStack(spacing: 22) {
-                        pandaAvatar(118).padding(.top, 54).shadow(color: PandaPalette.mint.opacity(0.28), radius: 28)
+                        pandaAvatar(104).padding(.top, 44).shadow(color: .black.opacity(0.35), radius: 22, y: 12)
                         VStack(spacing: 8) {
                             Text(didSearch ? "I found everything for you" : "What can I find for you?")
                                 .font(.system(size: 29, weight: .bold, design: .rounded))
@@ -236,7 +264,11 @@ struct ContentView: View {
                 }
                 .scrollIndicators(.hidden)
             }
-            promptBar.padding(.horizontal, 36).padding(.vertical, 22).background(PandaPalette.canvas)
+            promptBar
+                .padding(.horizontal, 22)
+                .padding(.bottom, 20)
+                .padding(.top, 10)
+                .background(PandaPalette.workspace)
         }
         }
     }
@@ -332,8 +364,10 @@ struct ContentView: View {
             .buttonStyle(.plain).disabled(prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isSearching)
             .opacity(prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? 0.45 : 1)
         }
-        .padding(12).background(PandaPalette.panel, in: RoundedRectangle(cornerRadius: 22))
-        .overlay(RoundedRectangle(cornerRadius: 22).stroke(.white.opacity(0.12)))
+        .padding(10)
+        .background(PandaPalette.elevated, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 20, style: .continuous).stroke(PandaPalette.strokeStrong))
+        .shadow(color: .black.opacity(0.3), radius: 18, y: 8)
     }
 
     private func pandaAvatar(_ size: CGFloat) -> some View {
@@ -1493,6 +1527,15 @@ private struct TaskResultRow: View {
 /// A local, inspectable record of every image Panda has successfully indexed.
 /// The file hash in IndexedFile is the scan-once key; an edited file receives
 /// a new record, while an unchanged image never asks the VLM again.
+private enum ImageIndexViewMode: String, CaseIterable, Identifiable {
+    case list
+    case grid
+
+    var id: String { rawValue }
+    var title: String { rawValue.capitalized }
+    var icon: String { self == .list ? "list.bullet" : "square.grid.2x2" }
+}
+
 private struct ImageIndexWorkspace: View {
     @Query(
         filter: #Predicate<IndexedFile> { $0.mediaType == "image" },
@@ -1503,6 +1546,7 @@ private struct ImageIndexWorkspace: View {
     let onBack: () -> Void
     @State private var selectedPath: String?
     @State private var filter = ""
+    @State private var viewMode: ImageIndexViewMode = .list
 
     private var filteredImages: [IndexedFile] {
         guard !filter.isEmpty else { return images }
@@ -1530,19 +1574,37 @@ private struct ImageIndexWorkspace: View {
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 12) {
-                Button(action: onBack) { Label("Search", systemImage: "chevron.left") }
-                    .buttonStyle(.borderless)
-                    .foregroundStyle(PandaPalette.mint)
+                Button(action: onBack) {
+                    Image(systemName: "chevron.left")
+                        .font(.system(size: 13, weight: .bold))
+                        .frame(width: 36, height: 36)
+                        .background(PandaPalette.panel, in: Circle())
+                        .overlay(Circle().stroke(PandaPalette.stroke))
+                }
+                .buttonStyle(.plain).foregroundStyle(PandaPalette.mint)
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Image Index").font(.system(size: 22, weight: .bold, design: .rounded))
                     Text("\(images.count) indexed • \(describedImageCount) VLM-described • \(max(0, images.count - describedImageCount)) waiting")
                         .font(.system(size: 12)).foregroundStyle(.white.opacity(0.53))
                 }
                 Spacer()
-                TextField("Filter index", text: $filter)
-                    .textFieldStyle(.roundedBorder).frame(width: 220)
+                HStack(spacing: 8) {
+                    Image(systemName: "magnifyingglass").foregroundStyle(.white.opacity(0.45))
+                    TextField("Search indexed files", text: $filter).textFieldStyle(.plain)
+                }
+                .padding(.horizontal, 13).frame(width: 250, height: 38)
+                .background(PandaPalette.panel, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(PandaPalette.stroke))
+
+                Picker("View", selection: $viewMode) {
+                    ForEach(ImageIndexViewMode.allCases) { mode in
+                        Label(mode.title, systemImage: mode.icon).tag(mode)
+                    }
+                }
+                .labelsHidden().pickerStyle(.segmented).frame(width: 150)
             }
-            .padding(.horizontal, 30).padding(.vertical, 20).background(PandaPalette.topbar)
+            .padding(.horizontal, 22).padding(.vertical, 16).background(PandaPalette.topbar)
+            Divider().overlay(PandaPalette.stroke)
 
             if images.isEmpty {
                 ContentUnavailableView(
@@ -1553,39 +1615,57 @@ private struct ImageIndexWorkspace: View {
                 .foregroundStyle(.white.opacity(0.75))
             } else {
                 HSplitView {
-                    VStack(spacing: 0) {
-                        imageTableHeader
-                        Divider().overlay(.white.opacity(0.1))
-                        ScrollView {
-                            LazyVStack(spacing: 0) {
-                                ForEach(filteredImages) { image in
-                                    ImageIndexRow(image: image, isSelected: image.filePath == selectedImage?.filePath) {
-                                        selectedPath = image.filePath
+                    Group {
+                        if viewMode == .list {
+                            VStack(spacing: 0) {
+                                imageTableHeader
+                                Divider().overlay(PandaPalette.stroke)
+                                ScrollView {
+                                    LazyVStack(spacing: 6) {
+                                        ForEach(filteredImages) { image in
+                                            ImageIndexRow(image: image, isSelected: image.filePath == selectedImage?.filePath) {
+                                                selectedPath = image.filePath
+                                            }
+                                        }
                                     }
-                                    Divider().overlay(.white.opacity(0.07))
+                                    .padding(10)
                                 }
+                            }
+                        } else {
+                            ScrollView {
+                                LazyVGrid(
+                                    columns: [GridItem(.adaptive(minimum: 170, maximum: 230), spacing: 12)],
+                                    spacing: 12
+                                ) {
+                                    ForEach(filteredImages) { image in
+                                        ImageIndexGridCard(image: image, isSelected: image.filePath == selectedImage?.filePath) {
+                                            selectedPath = image.filePath
+                                        }
+                                    }
+                                }
+                                .padding(14)
                             }
                         }
                     }
-                    .frame(minWidth: 620)
+                    .frame(minWidth: 420, maxWidth: .infinity)
                     ImageIndexPreview(image: selectedImage)
-                        .frame(minWidth: 310, idealWidth: 385)
+                        .frame(minWidth: 260, idealWidth: 330)
+                        .padding(10)
                 }
             }
         }
-        .background(PandaPalette.canvas)
+        .background(PandaPalette.workspace)
         .preferredColorScheme(.dark)
     }
 
     private var imageTableHeader: some View {
         HStack(spacing: 12) {
             Text("IMAGE").frame(width: 56, alignment: .leading)
-            Text("TITLE").frame(width: 180, alignment: .leading)
-            Text("PATH — CLICK TO PREVIEW").frame(maxWidth: .infinity, alignment: .leading)
+            Text("PANDA SEES").frame(maxWidth: .infinity, alignment: .leading)
             Text("INDEXED").frame(width: 78, alignment: .leading)
         }
         .font(.system(size: 10, weight: .bold)).tracking(0.9).foregroundStyle(.white.opacity(0.42))
-        .padding(.horizontal, 16).padding(.vertical, 10)
+        .padding(.horizontal, 20).padding(.vertical, 11)
     }
 }
 
@@ -1603,17 +1683,36 @@ private struct ImageIndexRow: View {
                 Text(image.visualExplanation ?? "Waiting for the local vision description")
                     .font(.system(size: 11)).foregroundStyle(.white.opacity(0.52)).lineLimit(2)
             }
-            .frame(width: 180, alignment: .leading)
-            Button(action: select) {
-                Text(image.filePath).font(.system(size: 11)).foregroundStyle(PandaPalette.mint).lineLimit(2)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
-            .buttonStyle(.plain).help("Preview this image in Panda")
+            .frame(maxWidth: .infinity, alignment: .leading)
             Text(image.indexedAt, format: .dateTime.month(.abbreviated).day())
                 .font(.system(size: 11)).foregroundStyle(.white.opacity(0.5)).frame(width: 78, alignment: .leading)
         }
-        .padding(.horizontal, 16).padding(.vertical, 9)
-        .background(isSelected ? PandaPalette.mint.opacity(0.12) : .clear)
+        .padding(.horizontal, 12).padding(.vertical, 10)
+        .background(isSelected ? PandaPalette.mint.opacity(0.12) : PandaPalette.panel.opacity(0.42), in: RoundedRectangle(cornerRadius: 13, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 13, style: .continuous).stroke(isSelected ? PandaPalette.mint.opacity(0.35) : PandaPalette.stroke))
+        .contentShape(Rectangle()).onTapGesture(perform: select)
+    }
+}
+
+private struct ImageIndexGridCard: View {
+    let image: IndexedFile
+    let isSelected: Bool
+    let select: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            LocalImageThumbnail(path: image.filePath)
+                .frame(maxWidth: .infinity)
+                .aspectRatio(1.28, contentMode: .fit)
+            Text(image.visualTitle?.isEmpty == false ? image.visualTitle! : image.fileName)
+                .font(.system(size: 13, weight: .semibold)).lineLimit(1)
+            Text(image.visualExplanation ?? "Waiting for Panda's visual explanation")
+                .font(.system(size: 11)).foregroundStyle(.white.opacity(0.55)).lineLimit(2)
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(isSelected ? PandaPalette.mint.opacity(0.12) : PandaPalette.panel.opacity(0.5), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).stroke(isSelected ? PandaPalette.mint.opacity(0.4) : PandaPalette.stroke))
         .contentShape(Rectangle()).onTapGesture(perform: select)
     }
 }
@@ -1625,21 +1724,28 @@ private struct ImageIndexPreview: View {
         VStack(alignment: .leading, spacing: 16) {
             if let image, let nsImage = NSImage(contentsOf: URL(fileURLWithPath: image.filePath)) {
                 Image(nsImage: nsImage).resizable().scaledToFit().frame(maxWidth: .infinity, maxHeight: 300)
-                    .clipShape(RoundedRectangle(cornerRadius: 12))
-                Text(image.visualTitle?.isEmpty == false ? image.visualTitle! : image.fileName)
+                    .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                Text(image.fileName)
                     .font(.system(size: 18, weight: .bold))
+                Text("PANDA SEES")
+                    .font(.system(size: 10, weight: .bold)).tracking(1).foregroundStyle(PandaPalette.mint)
                 Text(image.visualExplanation ?? "No visual explanation is available yet.")
-                    .font(.system(size: 13)).foregroundStyle(.white.opacity(0.7))
+                    .font(.system(size: 13)).foregroundStyle(.white.opacity(0.7)).lineSpacing(3)
                 Divider().overlay(.white.opacity(0.1))
-                Text(image.filePath).font(.system(size: 11)).foregroundStyle(PandaPalette.mint).textSelection(.enabled)
-                Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: image.filePath)]) }
-                    .buttonStyle(.bordered).tint(PandaPalette.mint)
+                HStack(spacing: 10) {
+                    Button("Open") { NSWorkspace.shared.open(URL(fileURLWithPath: image.filePath)) }
+                        .buttonStyle(.borderedProminent).tint(PandaPalette.mint)
+                    Button("Reveal in Finder") { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: image.filePath)]) }
+                        .buttonStyle(.bordered).tint(PandaPalette.mint)
+                }
             } else {
-                ContentUnavailableView("Select an image", systemImage: "photo", description: Text("Click a path in the table to open its preview here."))
+                ContentUnavailableView("Select an image", systemImage: "photo", description: Text("Choose an indexed image to see what Panda understands."))
             }
             Spacer()
         }
-        .padding(22).background(PandaPalette.result)
+        .padding(22)
+        .background(PandaPalette.result, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 20, style: .continuous).stroke(PandaPalette.stroke))
     }
 }
 
@@ -1725,11 +1831,17 @@ private struct LocalResultPreview: View {
 }
 
 private enum PandaPalette {
-    static let canvas = Color(red: 0.018, green: 0.035, blue: 0.045)
-    static let sidebar = Color(red: 0.012, green: 0.025, blue: 0.033)
-    static let panel = Color(red: 0.055, green: 0.09, blue: 0.1)
-    static let result = Color(red: 0.075, green: 0.11, blue: 0.12)
-    static let topbar = Color(red: 0.06, green: 0.12, blue: 0.13)
-    static let glow = Color(red: 0.10, green: 0.48, blue: 0.42)
-    static let mint = Color(red: 0.16, green: 0.90, blue: 0.66)
+    // Neutral graphite surfaces model the floating vehicle-dashboard
+    // reference while Panda's mint remains the single functional accent.
+    static let canvas = Color(red: 0.055, green: 0.058, blue: 0.06)
+    static let workspace = Color(red: 0.075, green: 0.08, blue: 0.082)
+    static let sidebar = Color(red: 0.085, green: 0.09, blue: 0.092)
+    static let panel = Color(red: 0.12, green: 0.125, blue: 0.128)
+    static let elevated = Color(red: 0.145, green: 0.15, blue: 0.153)
+    static let result = Color(red: 0.105, green: 0.11, blue: 0.113)
+    static let topbar = Color(red: 0.095, green: 0.10, blue: 0.102)
+    static let glow = Color(red: 0.19, green: 0.23, blue: 0.21)
+    static let stroke = Color.white.opacity(0.075)
+    static let strokeStrong = Color.white.opacity(0.13)
+    static let mint = Color(red: 0.30, green: 0.87, blue: 0.61)
 }
